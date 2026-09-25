@@ -2,8 +2,9 @@ name: Build and Release Windows EXE
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - master
+      - main
   workflow_dispatch:
 
 permissions:
@@ -58,6 +59,7 @@ jobs:
           Compress-Archive -Path (Join-Path $dist 'SmartDrawingBoard-Page\*') -DestinationPath (Join-Path $releaseDir 'SmartDrawingBoard-Page.zip') -Force
 
       - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: |
