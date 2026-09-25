@@ -1,0 +1,56 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PyInstaller
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            build/pyi-work
+            build/pyi-spec
+          key: ${{ runner.os }}-pyinstaller-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pyinstaller-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Build EXE
+        run: |
+          python build_exe.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartDrawingBoard-Windows
+          path: |
+            dist/SmartDrawingBoard-Launcher/**/*
+            dist/SmartDrawingBoard-Main/**/*
+            dist/SmartDrawingBoard-Page/**/*
+          retention-days: 14
+          compression-level: 9
+          if-no-files-found: error
