@@ -187,6 +187,12 @@ class TestLauncherRuntime(unittest.TestCase):
         self.assertTrue(kb.list_pages(PORT), "页面没注册成功")
 
         self.app.on_close()
+        # 启动器已发 taskkill；再手动触发一次内核巡检，
+        # 避免等 30 秒后台 reap 线程才把死亡页面从注册表里清掉。
+        try:
+            kb.reap(PORT)
+        except Exception:
+            pass
         deadline = time.time() + 10
         while time.time() < deadline:
             if not kb.list_pages(PORT):

@@ -206,60 +206,89 @@ def handle_band_fit(body):
         r = bf.band_fit(page.points, n_segments=n_seg, degree=deg)
     except bf.BandFitError as e:
         raise KernelError(str(e))
-    except Exception as e:  # 内核异常单独归类，便于排查
+    except Exception as e:
         raise KernelError(f"内核异常: {type(e).__name__}: {e}", 500)
 
     with _lock:
-        page.last_result = {
-            "expression": r.expression,
-            "coefficients": list(r.coefficients),
-            "upper": {
-                "expression": r.upper.expression,
-                "coefficients": list(r.upper.coefficients),
-            },
-            "lower": {
-                "expression": r.lower.expression,
-                "coefficients": list(r.lower.coefficients),
-            },
-            "offset": r.offset,
-            "r2": r.r2,
-            "rmse": r.rmse,
-            "mean_abs_dev": r.mean_abs_dev,
-            "n_points": r.n_points,
-            "n_segments": r.n_segments,
-            "degree_upper": r.degree_upper,
-            "degree_lower": r.degree_lower,
-            "y_min": r.y_min,
-            "y_max": r.y_max,
-            "scatter": {
-                "d_values": list(r.scatter.d_values),
-                "spreads": list(r.scatter.spreads),
-                "mean_d": r.scatter.mean_d,
-                "min_d": r.scatter.min_d,
-                "max_d": r.scatter.max_d,
-                "head_mean": r.scatter.head_mean,
-                "tail_mean": r.scatter.tail_mean,
-                "tail_ratio": r.scatter.tail_ratio,
-                "trend": r.scatter.trend,
-                "swing": r.scatter.swing,
-                "widest_segment": r.scatter.widest_segment,
-                "tightest_segment": r.scatter.tightest_segment,
-                "description": r.scatter.description,
-            },
-            "segments": [
-                {
-                    "index": s.index, "x_lo": s.x_lo, "x_hi": s.x_hi,
-                    "center": s.center, "mean_y": s.mean_y,
-                    "n_upper": s.n_upper, "n_lower": s.n_lower,
-                    "d": s.d_mean_points, "spread": s.spread,
-                }
-                for s in r.segments
-            ],
-            "caution": r.caution,
-        }
+        page.last_result = _pack_band_result(r)
         page.touch()
-        result = dict(page.last_result)
+    result = dict(page.last_result)
+    result["algorithm"] = "classic"
     return _ok({"result": result})
+
+
+def handle_band_fit_improved(body):
+    page = _need_session(body)
+    if "points" in body:
+        page.points = _as_points(body["points"])
+    if not page.points:
+        raise KernelError("页面上没有点集，请先传入 points")
+    n_seg = _ints(body, "n_segments", bf.DEFAULT_SEGMENTS, 2, 200)
+    deg = _ints(body, "degree", bf.DEFAULT_DEGREE, 0, 20)
+
+    try:
+        r = bf.band_fit_improved(page.points, n_segments=n_seg, degree=deg)
+    except bf.BandFitError as e:
+        raise KernelError(str(e))
+    except Exception as e:
+        raise KernelError(f"内核异常: {type(e).__name__}: {e}", 500)
+
+    with _lock:
+        page.last_result = _pack_band_result(r)
+        page.touch()
+    result = dict(page.last_result)
+    result["algorithm"] = "improved"
+    return _ok({"result": result})
+
+
+def _pack_band_result(r: bf.BandFitResult) -> dict:
+    return {
+        "expression": r.expression,
+        "coefficients": list(r.coefficients),
+        "upper": {
+            "expression": r.upper.expression,
+            "coefficients": list(r.upper.coefficients),
+        },
+        "lower": {
+            "expression": r.lower.expression,
+            "coefficients": list(r.lower.coefficients),
+        },
+        "offset": r.offset,
+        "r2": r.r2,
+        "rmse": r.rmse,
+        "mean_abs_dev": r.mean_abs_dev,
+        "n_points": r.n_points,
+        "n_segments": r.n_segments,
+        "degree_upper": r.degree_upper,
+        "degree_lower": r.degree_lower,
+        "y_min": r.y_min,
+        "y_max": r.y_max,
+        "scatter": {
+            "d_values": list(r.scatter.d_values),
+            "spreads": list(r.scatter.spreads),
+            "mean_d": r.scatter.mean_d,
+            "min_d": r.scatter.min_d,
+            "max_d": r.scatter.max_d,
+            "head_mean": r.scatter.head_mean,
+            "tail_mean": r.scatter.tail_mean,
+            "tail_ratio": r.scatter.tail_ratio,
+            "trend": r.scatter.trend,
+            "swing": r.scatter.swing,
+            "widest_segment": r.scatter.widest_segment,
+            "tightest_segment": r.scatter.tightest_segment,
+            "description": r.scatter.description,
+        },
+        "segments": [
+            {
+                "index": s.index, "x_lo": s.x_lo, "x_hi": s.x_hi,
+                "center": s.center, "mean_y": s.mean_y,
+                "n_upper": s.n_upper, "n_lower": s.n_lower,
+                "d": s.d_mean_points, "spread": s.spread,
+            }
+            for s in r.segments
+        ],
+        "caution": r.caution,
+    }
 
 
 def handle_poly_fit(body):
@@ -769,6 +798,7 @@ ROUTES = {
     "/api/save_points": handle_save_points,
     "/api/get_points": handle_get_points,
     "/api/band_fit": handle_band_fit,
+    "/api/band_fit_improved": handle_band_fit_improved,
     "/api/poly_fit": handle_poly_fit,
     "/api/import_table": handle_import_table,
     "/api/dev_series": handle_dev_series,

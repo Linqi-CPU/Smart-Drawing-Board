@@ -155,6 +155,18 @@ class KernelClient:
             payload["points"] = [list(p) for p in points]
         return self.post("/api/band_fit", payload).get("result", {})
 
+    def band_fit_improved(self, session_id: str,
+                          points: Optional[List[Tuple[float, float]]] = None,
+                          n_segments: int = 8, degree: int = 2) -> dict:
+        payload: Dict[str, Any] = {
+            "session_id": session_id,
+            "n_segments": n_segments,
+            "degree": degree,
+        }
+        if points is not None:
+            payload["points"] = [list(p) for p in points]
+        return self.post("/api/band_fit_improved", payload).get("result", {})
+
     def poly_fit(self, session_id: str,
                  points: Optional[List[Tuple[float, float]]] = None,
                  degree: int = 2) -> dict:

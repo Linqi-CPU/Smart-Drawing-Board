@@ -158,6 +158,15 @@ class BandPage:
         self.sp_step.set(3)
         self.sp_step.grid(row=2, column=1, sticky=tk.E)
 
+        ttk.Label(params, text="算法选择").grid(row=3, column=0, sticky=tk.W,
+                                                pady=3)
+        self.algo_var = tk.StringVar(value="classic")
+        algo_cb = ttk.Combobox(params, textvariable=self.algo_var,
+                               values=["classic", "improved", "compare"],
+                               state="readonly", width=8)
+        algo_cb.grid(row=3, column=1, sticky=tk.E)
+        algo_cb.set("classic")
+
         params.columnconfigure(1, weight=1)
 
         # ---- 数据来源 ----
@@ -416,16 +425,59 @@ class BandPage:
                          args=(p,), daemon=True).start()
 
     def _run_calc_worker(self, p: dict) -> None:
+        algo = getattr(self, "algo_var", None) and self.algo_var.get() or "classic"
         try:
-            res = self.client.band_fit(self.session_id,
-                                       n_segments=p["n_segments"],
-                                       degree=p["degree"])
-            self.root.after(0, lambda: self._on_calc_done(res, p))
+            if algo == "improved":
+                res = self.client.band_fit_improved(self.session_id,
+                                                    n_segments=p["n_segments"],
+                                                    degree=p["degree"])
+                self.root.after(0, lambda: self._on_calc_done(res, p, "improved"))
+            elif algo == "compare":
+                classic = self.client.band_fit(self.session_id,
+                                               n_segments=p["n_segments"],
+                                               degree=p["degree"])
+                improved = self.client.band_fit_improved(self.session_id,
+                                                         n_segments=p["n_segments"],
+                                                         degree=p["degree"])
+                self.root.after(0, lambda: self._on_compare_done(classic, improved, p))
+            else:
+                res = self.client.band_fit(self.session_id,
+                                           n_segments=p["n_segments"],
+                                           degree=p["degree"])
+                self.root.after(0, lambda: self._on_calc_done(res, p, "classic"))
         except KernelClientError as e:
             self.root.after(0, lambda: self._on_calc_error(e))
         except Exception as e:
             self.root.after(0, lambda: self._on_calc_error(
                 KernelClientError(f"{type(e).__name__}: {e}")))
+
+    def _on_compare_done(self, classic: dict, improved: dict, p: dict) -> None:
+        self.root.config(cursor="")
+        self.result = classic
+        self.result_improved = improved
+        self._render_compare_text(classic, improved)
+        self._set_status(f"对比完成 | 经典 R²={classic.get('r2', 0):.3f} / 改进 R²={improved.get('r2', 0):.3f}")
+        try:
+            self._draw_compare_band(classic, improved)
+            self._draw_compare_dev(classic, improved)
+        except Exception as e:
+            self._set_status(f"对比曲线绘制失败: {e}")
+
+    def _render_compare_text(self, classic: dict, improved: dict) -> None:
+        lines = [
+            f"页面编号: {self.session_id}",
+            f"点数 {classic.get('n_points', 0)}，分段 {classic.get('n_segments', 0)}",
+            "",
+            "=== 经典算法 ===",
+            f"走势: {classic.get('expression', '')}",
+            f"R² = {classic.get('r2', 0):.6f}   RMSE = {classic.get('rmse', 0):.6g}",
+            "",
+            "=== 改进算法 ===",
+            f"走势: {improved.get('expression', '')}",
+            f"R² = {improved.get('r2', 0):.6f}   RMSE = {improved.get('rmse', 0):.6g}",
+        ]
+        self.result_text.delete("1.0", tk.END)
+        self.result_text.insert(tk.END, "\n".join(lines))
 
     def _on_calc_error(self, err) -> None:
         self.root.config(cursor="")
@@ -508,6 +560,43 @@ class BandPage:
             ("band", xs, lo, up, "#f1c40f", "离散区间"),
             ("line", xs, trend_y, "#2c3e50", "整体走势"),
         ], title=self.result["expression"])
+
+    def _draw_compare_band(self, classic: dict, improved: dict) -> None:
+        """对比模式：同一张图里叠经典/改进两条走势。"""
+        if not classic or not improved:
+            return
+        bs = self.client.band_series(self.session_id, step=self._params()["step"])
+        xs, up, lo = bs["xs"], bs["upper"], bs["lower"]
+        xs_all = [p[0] for p in self.points]
+        ys_all = [p[1] for p in self.points]
+
+        classic_trend = [classic["coefficients"][i] for i in range(len(classic["coefficients"]))]
+        improved_trend = [improved["coefficients"][i] for i in range(len(improved["coefficients"]))]
+        classic_y = [_poly(classic_trend, x) for x in xs]
+        improved_y = [_poly(improved_trend, x) for x in xs]
+
+        self._plot(self.canvas1, [
+            ("scatter", xs_all, ys_all, "#4a9eff", "离散点"),
+            ("line", xs, up, "#e74c3c", "上界 f_up"),
+            ("line", xs, lo, "#27ae60", "下界 f_lo"),
+            ("band", xs, lo, up, "#f1c40f", "离散区间"),
+            ("line", xs, classic_y, "#2c3e50", "经典走势"),
+            ("line", xs, improved_y, "#9b59b6", "改进走势"),
+        ], title=f"对比 | 经典 R²={classic.get('r2', 0):.3f} / 改进 R²={improved.get('r2', 0):.3f}")
+
+    def _draw_compare_dev(self, classic: dict, improved: dict) -> None:
+        if not classic or not improved:
+            return
+        ds = self.client.dev_series(self.session_id,
+                                    step=self._params()["step"])
+        xs, d = ds["xs"], ds["d"]
+        mean_d = classic.get("scatter", {}).get("mean_d", improved.get("scatter", {}).get("mean_d", 0))
+        self._plot(self.canvas2, [
+            ("line", xs, d, "#8e44ad", "离散宽度 d(x)"),
+            ("hline", xs, mean_d, "#7f8c8d", f"平均 {mean_d:.4g}"),
+            ("area", xs, 0, d, "#8e44ad", ""),
+        ], title=f"离散程度 经典={classic.get('scatter', {}).get('trend', '')} / 改进={improved.get('scatter', {}).get('trend', '')}",
+            yzero=True)
 
     def _draw_dev(self) -> None:
         """画离散宽度曲线。"""

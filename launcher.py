@@ -239,7 +239,7 @@ class LauncherApp:
             if not pid:
                 continue
             try:
-                r = subprocess.run(["taskkill", "/PID", str(pid)],
+                r = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                                    capture_output=True, timeout=10)
                 (ok if r.returncode == 0 else failed).append(
                     f"{p['session_id']}({pid})")
@@ -274,10 +274,20 @@ class LauncherApp:
             if not pid:
                 continue
             try:
-                subprocess.run(["taskkill", "/PID", str(pid)],
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                                capture_output=True, timeout=8)
             except Exception:
                 pass
+
+        # 等待页面真正退出并从内核注销
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            try:
+                if not list_pages(DEFAULT_PORT):
+                    break
+            except Exception:
+                break
+            time.sleep(0.2)
 
         # 自己拉起的进程（主 UI）
         for proc in self._children.values():

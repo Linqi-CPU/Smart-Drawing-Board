@@ -350,7 +350,7 @@ def band_fit(
     degree: int = DEFAULT_DEGREE,
     coef_tol: float = DEFAULT_COEF_TOL,
 ) -> BandFitResult:
-    """对离散点做分段包络估计，得到整体走势与离散程度画像。
+    """经典分段包络估计：分段均值切分上下组，分别拟合后系数调和。
 
     points   [(x, y), ...]  围绕真实曲线散布的离散点
     """
@@ -548,6 +548,159 @@ def describe_segments(result: BandFitResult) -> str:
     return "\n".join(lines)
 
 
+# ==================================================================
+# 改进版：中位数切分 + 中心线直接拟合
+# ==================================================================
+def band_fit_improved(
+    points: Sequence,
+    n_segments: int = DEFAULT_SEGMENTS,
+    degree: int = DEFAULT_DEGREE,
+    coef_tol: float = DEFAULT_COEF_TOL,
+) -> BandFitResult:
+    """改进版分段包络估计：中位数切分上下组，中心线直接拟合全量点。
+
+    相比经典版：
+    - 分组改用中位数，对离群点更稳健
+    - 中心线不再依赖上下界反推，而是直接对全量点拟合
+    """
+    if not points or len(points) < 2:
+        raise BandFitError("至少需要 2 个离散点")
+    if degree < 0:
+        raise BandFitError("阶数不能为负")
+
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    if max(xs) - min(xs) <= 0:
+        raise BandFitError("所有 x 相同，无法分段")
+    if max(ys) - min(ys) <= 0:
+        raise BandFitError("所有 y 相同，无离散可言，无需估计走势")
+
+    n_seg = max(2, min(int(n_segments), len(points) // 2))
+    segments = make_segments(xs, n_seg)
+    means, counts = segment_means(xs, ys, segments)
+
+    # 中位数切分：比均值更稳健
+    upper: List[Tuple[float, float]] = []
+    lower: List[Tuple[float, float]] = []
+    seg_medians: List[float] = []
+    for i, (lo_x, hi_x) in enumerate(segments):
+        if not math.isfinite(means[i]):
+            seg_medians.append(float("nan"))
+            continue
+        seg_ys = [y for x, y in zip(xs, ys) if segment_of(x, segments) == i]
+        if not seg_ys:
+            seg_medians.append(float("nan"))
+            continue
+        seg_ys_sorted = sorted(seg_ys)
+        n = len(seg_ys_sorted)
+        if n % 2 == 1:
+            seg_medians.append(seg_ys_sorted[n // 2])
+        else:
+            seg_medians.append((seg_ys_sorted[n // 2 - 1] + seg_ys_sorted[n // 2]) / 2.0)
+
+    for x, y in zip(xs, ys):
+        i = segment_of(x, segments)
+        m = seg_medians[i]
+        if not math.isfinite(m):
+            continue
+        (upper if y >= m else lower).append((x, y))
+
+    if not upper or not lower:
+        raise BandFitError(
+            "所有点都落在分段中位数的同一侧，无法构成上下界。\n"
+            "请增加分段数或补充更有起伏的数据。"
+        )
+
+    up_fit, deg_up = _fit_branch(upper, degree)
+    lo_fit, deg_lo = _fit_branch(lower, degree)
+
+    # 中心线：直接拟合全量点
+    center_fit, deg_center = _fit_branch(points, degree)
+    reconciled = reconcile_coefficients(
+        up_fit.coefficients, lo_fit.coefficients, coef_tol, mode="mean"
+    )
+    final_coeffs = list(center_fit.coefficients)
+    expression = ft.format_polynomial(final_coeffs)
+
+    # 分段统计
+    seg_cix: List[List[int]] = [[] for _ in segments]
+    for idx, x in enumerate(xs):
+        seg_cix[segment_of(x, segments)].append(idx)
+
+    seg_bands: List[SegmentBand] = []
+    d_values: List[float] = []
+    spreads: List[float] = []
+    for i, (lo_x, hi_x) in enumerate(segments):
+        if not math.isfinite(means[i]):
+            continue
+        center = (lo_x + hi_x) / 2.0
+        idxs = seg_cix[i]
+        seg_ys = [ys[k] for k in idxs]
+        d_c = up_fit.predict(center) - lo_fit.predict(center)
+        d_pts = [abs(up_fit.predict(xs[k]) - lo_fit.predict(xs[k]))
+                 for k in idxs]
+        d_mean = sum(d_pts) / len(d_pts) if d_pts else abs(d_c)
+        n_up = sum(1 for k in idxs if ys[k] >= means[i])
+        seg_bands.append(SegmentBand(
+            index=i, x_lo=lo_x, x_hi=hi_x, center=center,
+            mean_y=means[i], n_upper=n_up, n_lower=len(idxs) - n_up,
+            d_center=d_c, d_mean_points=d_mean,
+            spread=(max(seg_ys) - min(seg_ys)) if seg_ys else 0.0,
+        ))
+        d_values.append(d_mean)
+        spreads.append(seg_bands[-1].spread)
+
+    scatter = profile_scatter(d_values, spreads)
+
+    preds = [center_fit.predict(x) for x in xs]
+    ybar = sum(ys) / len(ys)
+    ss_tot = sum((y - ybar) ** 2 for y in ys)
+    ss_res = sum((y - p) ** 2 for y, p in zip(ys, preds))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+    rmse = math.sqrt(ss_res / len(ys)) if ys else 0.0
+    mean_abs_dev = sum(abs(y - p) for y, p in zip(ys, preds)) / len(ys)
+
+    caution = ""
+    half_band = scatter.mean_d / 2.0
+    if half_band > 1e-12 and mean_abs_dev > 1.5 * half_band:
+        caution = (
+            f"走势线与散点的平均偏差 {mean_abs_dev:.4g}，"
+            f"约为半带宽 {half_band:.4g} 的 "
+            f"{mean_abs_dev / half_band:.1f} 倍。"
+        )
+    if r2 < 0:
+        caution = (
+            f"走势线 R² = {r2:.4f} 为负，表示它比直接取均值还差，"
+            f"当前阶数或分段设置不适合这批数据。"
+        )
+    elif not caution and r2 < 0.5:
+        caution = (
+            f"走势线 R² = {r2:.4f} 偏低，说明单个多项式表达不了这批"
+            f"散点的整体走势（可能趋势本身分段、或离散过强）。"
+        )
+
+    return BandFitResult(
+        upper=up_fit,
+        lower=lo_fit,
+        reconciled=tuple(reconciled),
+        offset=0.0,
+        coefficients=tuple(final_coeffs),
+        expression=expression,
+        segments=tuple(seg_bands),
+        scatter=scatter,
+        degree_upper=deg_up,
+        degree_lower=deg_lo,
+        n_points=len(points),
+        n_segments=len(seg_bands),
+        y_min=min(ys),
+        y_max=max(ys),
+        r2=r2,
+        rmse=rmse,
+        mean_abs_dev=mean_abs_dev,
+        caution=caution,
+    )
+
+
 __all__ = [
     "BandFitError",
     "BandFitResult",
@@ -557,6 +710,7 @@ __all__ = [
     "DEFAULT_DEGREE",
     "DEFAULT_COEF_TOL",
     "band_fit",
+    "band_fit_improved",
     "band_series",
     "dev_series",
     "describe_segments",
