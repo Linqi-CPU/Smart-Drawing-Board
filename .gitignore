@@ -51,6 +51,11 @@ $RECYCLE.BIN/
 drawing.png
 *.tmp
 *.bak
+# 内核启动日志是纯本地噪音：由 core/server.py 每次启动追加写入，
+# 记录 pid/ppid/Job 归属用于事后判断进程死因，不该进版本库。
+.kernel.log
+# Windows 下手滑 `> nul` 会在仓库根留下一个名为 nul 的文件
+nul
 !functions/*.py
 
 # ---------- IDE ----------

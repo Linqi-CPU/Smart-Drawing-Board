@@ -29,6 +29,37 @@ from core.client import KernelClient, KernelClientError
 APP_NAME = "分段包络估计"
 PAGE_TAG = "band"
 
+# 算法下拉框的「显示名 → 内部 key」映射。
+# 为什么不直接让 Combobox 存中文值：UI 未打开时 algo_var.get() 会返回
+# 默认值，而 _run_calc_worker 里是按内部 key 分支的。若把中文直接当值，
+# 老配置/旧 session 恢复时会落进 else 分支静默按经典算法跑，用户毫无察觉。
+# 因此这里固定用「中文显示 + 英文 key 值」，读取时统一走 _algo_key()。
+ALGO_LABELS = {
+    "classic": "经典算法",
+    "improved": "改进算法",
+    "compare": "对比模式",
+}
+#: 下拉框显示顺序（中文），与上面的 key 一一对应
+ALGO_DISPLAY = [ALGO_LABELS["classic"],
+                ALGO_LABELS["improved"],
+                ALGO_LABELS["compare"]]
+#: 中文显示名 → 内部 key，供 _algo_key() 反查
+_ALGO_KEYS = {v: k for k, v in ALGO_LABELS.items()}
+DEFAULT_ALGO = "classic"
+
+
+def _algo_key(raw: str) -> str:
+    """把下拉框当前显示值换算成内部算法 key。
+
+    兼容三种输入：中文显示名、英文 key（历史配置/测试直接设值）、
+    以及其他值统一回落 DEFAULT_ALGO。未知值不抛异常——下拉框是 UI，
+    不该因为一个脏值让整个页面崩掉。
+    """
+    raw = (raw or "").strip()
+    if raw in ALGO_LABELS:          # 已经是内部 key
+        return raw
+    return _ALGO_KEYS.get(raw, DEFAULT_ALGO)
+
 # 示例数据集：围绕已知曲线散布，便于验证算法
 def demo_points(n: int = 60, kind: str = "linear"):
     """示例点集。返回 (点列表, 描述)。"""
@@ -160,12 +191,12 @@ class BandPage:
 
         ttk.Label(params, text="算法选择").grid(row=3, column=0, sticky=tk.W,
                                                 pady=3)
-        self.algo_var = tk.StringVar(value="classic")
+        self.algo_var = tk.StringVar(value=DEFAULT_ALGO)
         algo_cb = ttk.Combobox(params, textvariable=self.algo_var,
-                               values=["classic", "improved", "compare"],
+                               values=ALGO_DISPLAY,
                                state="readonly", width=8)
         algo_cb.grid(row=3, column=1, sticky=tk.E)
-        algo_cb.set("classic")
+        algo_cb.set(ALGO_LABELS[DEFAULT_ALGO])
 
         params.columnconfigure(1, weight=1)
 
@@ -425,7 +456,7 @@ class BandPage:
                          args=(p,), daemon=True).start()
 
     def _run_calc_worker(self, p: dict) -> None:
-        algo = getattr(self, "algo_var", None) and self.algo_var.get() or "classic"
+        algo = _algo_key(getattr(self, "algo_var", None) and self.algo_var.get())
         try:
             if algo == "improved":
                 res = self.client.band_fit_improved(self.session_id,
