@@ -210,6 +210,34 @@ class TestRepoIgnoresBuildDirs(unittest.TestCase):
         self.assertEqual(Path(be._DIST).resolve(), repo / "dist")
         self.assertEqual(Path(be._RELEASE).resolve(), repo / "release")
 
+    def test_no_non_ascii_outside_reconfigure_guard(self):
+        """中文提示只能出现在 reconfigure 之后。
+
+        CI 的 windows runner 不设 PYTHONIOENCODING，stdout 是 cp1252，
+        任何中文 print 都会让打包挂在最后一步（Run #10 实测）。
+        这里保证 reconfigure 调用位于所有中文输出之前。
+        """
+        src = Path(be.__file__).read_text(encoding="utf-8")
+        self.assertIn("reconfigure", src,
+                      "build_exe.py 必须重配 stdout 编码才能安全输出中文")
+
+        # reconfigure 必须出现在模块顶层 import 之后、任何 print 之前
+        import ast
+        tree = ast.parse(src)
+        first_print_line = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "print":
+                if first_print_line is None or node.lineno < first_print_line:
+                    first_print_line = node.lineno
+        reconf_line = src.splitlines().index(
+            [ln for ln in src.splitlines() if "reconfigure" in ln][0]
+        ) + 1
+        if first_print_line is not None:
+            self.assertLess(
+                reconf_line, first_print_line,
+                "reconfigure 必须早于第一个 print，否则中文仍会崩",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

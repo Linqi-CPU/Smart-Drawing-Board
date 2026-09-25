@@ -30,6 +30,21 @@ import zipfile
 from pathlib import Path
 from typing import List
 
+# ------------------------------------------------------------------
+# 输出编码：Windows 控制台默认 cp1252，中文 print 会直接 UnicodeEncodeError
+# ------------------------------------------------------------------
+# GitHub Actions 的 windows runner 不设 PYTHONIOENCODING，
+# Python 3.11 的 sys.stdout 会按 cp1252（或 GBK）编码，
+# 本脚本里任何中文提示都会让整个打包挂在最后一步。
+# 历史上也踩过：见 CHANGELOG 里 d968685「remove non-ASCII output」，
+# 那是靠删中文绕过，这里改成无条件重配为 UTF-8，中文可以放心写。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    # 老版本 Python 或已被外部重定向时没有 reconfigure，退回收紧输出
+    pass
+
 _HERE = Path(__file__).resolve().parent
 _DIST = _HERE / "dist"
 _RELEASE = _HERE / "release"
