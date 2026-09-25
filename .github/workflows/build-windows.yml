@@ -47,21 +47,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
 
-      - name: Build EXE
+      # 打包（含源码 zip 与三个成品 zip）全部收在 build_exe.py 里，
+      # 本地与 CI 走同一份逻辑，避免两边行为不一致。
+      - name: Build EXE and package release zips
         run: |
           python build_exe.py
-
-      - name: Package artifacts
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dist = Join-Path $PWD 'dist'
-          $releaseDir = Join-Path $PWD 'release'
-          if (Test-Path $releaseDir) { Remove-Item -Recurse -Force $releaseDir }
-          New-Item -ItemType Directory -Path $releaseDir | Out-Null
-
-          Compress-Archive -Path (Join-Path $dist 'SmartDrawingBoard-Launcher\*') -DestinationPath (Join-Path $releaseDir 'SmartDrawingBoard-Launcher.zip') -Force
-          Compress-Archive -Path (Join-Path $dist 'SmartDrawingBoard-Main\*') -DestinationPath (Join-Path $releaseDir 'SmartDrawingBoard-Main.zip') -Force
-          Compress-Archive -Path (Join-Path $dist 'SmartDrawingBoard-Page\*') -DestinationPath (Join-Path $releaseDir 'SmartDrawingBoard-Page.zip') -Force
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
