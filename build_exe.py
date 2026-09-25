@@ -91,9 +91,9 @@ def main() -> int:
     _build_entry("SmartDrawingBoard-Main", _HERE / "main.py")
     _build_entry("SmartDrawingBoard-Page", _HERE / "edit" / "__main__.py")
 
-    print("\n打包完成，产物在 dist/ 下：")
+    print("\nBuild complete. Artifacts under dist/:")
     for p in sorted((_HERE / "dist").iterdir()):
-        print(" -", p.name)
+        print(" - " + p.name)
     return 0
 
 
