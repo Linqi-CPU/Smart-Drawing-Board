@@ -74,8 +74,8 @@ def _build_entry(name: str, script: Path) -> None:
         f"--name={name}",
         *_common_options(),
     ]
-    print(f"\n>>> 打包：{name}")
-    print("    入口：" + str(script))
+    print(f"\n>>> Building: {name}")
+    print("    Entry: " + str(script))
     import subprocess
 
     proc = subprocess.run(args, cwd=str(_HERE))
