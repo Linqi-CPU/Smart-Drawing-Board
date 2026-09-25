@@ -234,6 +234,22 @@ python -m unittest tests.test_kernel_integration tests.test_lifecycle -v
 
 ```bash
 pip install pyinstaller
+python build_exe.py
+```
+
+产出目录：`dist/`
+- `SmartDrawingBoard-Launcher`：启动器
+- `SmartDrawingBoard-Main`：主绘图板
+- `SmartDrawingBoard-Page`：独立页面进程（如分段包络估计）
+
+```bash
+# 只打启动器
+python -m PyInstaller launcher.py --name SmartDrawingBoard-Launcher ...
+```
+
+`main.spec` 已配置好：
+
+```bash
 pyinstaller main.spec
 ```
 
@@ -292,6 +308,12 @@ python -m unittest discover -s tests -v   # 提交前先跑测试
 ## 更新日志
 
 见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 开源说明
+
+本项目已开源至 GitHub：https://github.com/Linqi-CPU/Smart-Drawing-Board
+
+欢迎 Issue / PR，也欢迎基于此项目做二次开发。
 
 ## 许可证
 
