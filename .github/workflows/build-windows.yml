@@ -1,11 +1,13 @@
-name: Build Windows EXE
+name: Build and Release Windows EXE
 
 on:
   push:
-    branches:
-      - master
-      - main
+    tags:
+      - "v*"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -43,14 +45,25 @@ jobs:
         run: |
           python build_exe.py
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Package artifacts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = Join-Path $PWD 'dist'
+          $releaseDir = Join-Path $PWD 'release'
+          if (Test-Path $releaseDir) { Remove-Item -Recurse -Force $releaseDir }
+          New-Item -ItemType Directory -Path $releaseDir | Out-Null
+
+          Compress-Archive -Path (Join-Path $dist 'SmartDrawingBoard-Launcher\*') -DestinationPath (Join-Path $releaseDir 'SmartDrawingBoard-Launcher.zip') -Force
+          Compress-Archive -Path (Join-Path $dist 'SmartDrawingBoard-Main\*') -DestinationPath (Join-Path $releaseDir 'SmartDrawingBoard-Main.zip') -Force
+          Compress-Archive -Path (Join-Path $dist 'SmartDrawingBoard-Page\*') -DestinationPath (Join-Path $releaseDir 'SmartDrawingBoard-Page.zip') -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
         with:
-          name: SmartDrawingBoard-Windows
-          path: |
-            dist/SmartDrawingBoard-Launcher/**/*
-            dist/SmartDrawingBoard-Main/**/*
-            dist/SmartDrawingBoard-Page/**/*
-          retention-days: 14
-          compression-level: 9
-          if-no-files-found: error
+          files: |
+            release/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
