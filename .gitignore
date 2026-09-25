@@ -1,0 +1,64 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+venv*/
+env/
+ENV/
+
+# ---------- 测试与缓存 ----------
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# ---------- 旧版备份（重构前的 main.py，保留在本地但不入库） ----------
+main_legacy_v1.py.bak
+
+# ---------- OS 生成文件 ----------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+$RECYCLE.BIN/
+*.lnk
+
+# ---------- 项目导出物 ----------
+drawing.png
+*.tmp
+*.bak
+!functions/*.py
+
+# ---------- IDE ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 注意：functions/ 下的用户函数应纳入版本管理，
+# 因此不要忽略该目录本身，也不要忽略其中的 .py 文件。
