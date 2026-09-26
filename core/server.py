@@ -47,6 +47,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import band_advanced as ba               # noqa: E402
 import band_fit as bf                      # noqa: E402
 import data_import as di                  # noqa: E402
 import fitting as ft                      # noqa: E402
@@ -238,6 +239,233 @@ def handle_band_fit_improved(body):
         page.touch()
     result = dict(page.last_result)
     result["algorithm"] = "improved"
+    return _ok({"result": result})
+
+
+# ==================================================================
+# 进阶算法（band_advanced）：分位数回归 / Bootstrap / 自适应分段 / AIC-BIC
+# ==================================================================
+#: 进阶功能默认全部关闭，由 body 显式开启。
+#: GPU 尤其要默认关：项目承诺零依赖、解压即用，
+#: 而 torch 会让 Release 体积翻数倍，默认开等于逼所有用户装它。
+ADV_DEFAULTS = {
+    "n_segments": 8,
+    "degree": 2,
+    "n_boot": 0,
+    "alpha": 0.05,
+    "select_degree": False,
+    "adaptive": False,
+    "quantile_tau": 0.5,
+    "use_gpu": False,
+    "criterion": "bic",
+}
+
+
+def _adv_get(body, key):
+    """取 body 中的进阶参数，缺失时用默认值。"""
+    v = body.get(key, ADV_DEFAULTS[key])
+    return ADV_DEFAULTS[key] if v is None else v
+
+
+def _adv_points(body):
+    """取 points 字段，返回 [(x, y), ...] 或 None。"""
+    raw = body.get("points")
+    if not raw:
+        return None
+    try:
+        return [(float(p[0]), float(p[1])) for p in raw]
+    except (TypeError, ValueError, IndexError):
+        raise KernelError("points 格式不正确，应为 [[x, y], ...]")
+
+
+def handle_band_advanced(body):
+    """进阶包络分析的统一入口。
+
+    body（均有默认值，见 ADV_DEFAULTS）：
+        points       [[x, y], ...]  可选；不给则用页面已有 points
+        n_segments   分段数
+        degree       阶数上限
+        n_boot       Bootstrap 次数，0 = 不做
+        alpha        Bootstrap 显著性水平（0.05 = 95% 置信）
+        select_degree true = 用 AIC/BIC 自动选阶
+        adaptive     true = 用自适应分段（按密度+离散度）
+        quantile_tau 分位数回归的分位点
+        use_gpu      true = 尝试 GPU 加速 Bootstrap
+        criterion    "aic" / "bic"
+        seed         随机种子，便于复现
+
+    返回的 result 除经典字段外，还带 "advanced" 子字典。
+    """
+    page = _need_session(body)
+
+    pts = _adv_points(body)
+    if pts is not None:
+        page.points = pts
+    if not page.points:
+        raise KernelError("页面上没有点集，请先传入 points")
+
+    n_seg = _ints(body, "n_segments", ADV_DEFAULTS["n_segments"], 2, 200)
+    degree = _ints(body, "degree", ADV_DEFAULTS["degree"], 0, 20)
+    n_boot = _ints(body, "n_boot", ADV_DEFAULTS["n_boot"], 0, 5000)
+    alpha = float(_adv_get(body, "alpha"))
+    if not (0.0 < alpha < 1.0):
+        raise KernelError("alpha 必须在 (0, 1) 之间")
+    tau = float(_adv_get(body, "quantile_tau"))
+    if not (0.0 < tau < 1.0):
+        raise KernelError("quantile_tau 必须在 (0, 1) 之间")
+    select_degree = bool(_adv_get(body, "select_degree"))
+    adaptive = bool(_adv_get(body, "adaptive"))
+    use_gpu = bool(_adv_get(body, "use_gpu"))
+    criterion = str(_adv_get(body, "criterion")).lower()
+    seed = body.get("seed", None)
+
+    xs = [float(p[0]) for p in page.points]
+    ys = [float(p[1]) for p in page.points]
+    adv = {
+        "effective_degree": degree,
+        "selection": None,
+        "segments": [],
+        "segment_strategy": "equal" if not adaptive else "adaptive",
+        "bootstrap": None,
+        "quantile": None,
+        "gpu_used": False,
+        "warnings": [],
+    }
+
+    # ---- AIC/BIC 自动选阶 ----
+    eff_degree = degree
+    if select_degree:
+        try:
+            sel = ba.select_degree(
+                page.points,
+                criterion=criterion,
+                max_degree=max(1, min(degree or 4, ft.MAX_DEGREE)),
+            )
+            eff_degree = int(sel.best.degree)
+            adv["effective_degree"] = eff_degree
+            adv["selection"] = {
+                "criterion": sel.criterion,
+                "best_degree": sel.best.degree,
+                "aic": sel.best.aic,
+                "bic": sel.best.bic,
+                "candidates": [
+                    {"degree": s.degree, "aic": s.aic, "bic": s.bic,
+                     "r2": s.r2, "rmse": s.rmse}
+                    for s in sel.candidates
+                ],
+            }
+        except Exception as e:
+            adv["warnings"].append(f"自动选阶失败，回退到 degree={degree}: {e}")
+
+    # ---- 分段（自适应 or 等宽）----
+    bounds = None
+    if adaptive:
+        try:
+            seg = ba.adaptive_segments(
+                xs, ys,
+                max_segments=n_seg,
+                min_points_per_seg=max(2, len(xs) // (n_seg * 2)),
+            )
+            bounds = list(seg.bounds)
+            adv["segment_strategy"] = "adaptive"
+            adv["segments"] = [
+                {"x_lo": b[0], "x_hi": b[1], "width": w}
+                for b, w in zip(bounds, seg.widths)
+            ]
+        except Exception as e:
+            adv["warnings"].append(f"自适应分段失败，回退到等宽分段: {e}")
+    if bounds is None:
+        try:
+            bounds = [tuple(s) for s in bf.make_segments(xs, n_seg)]
+            adv["segments"] = [
+                {"x_lo": b[0], "x_hi": b[1], "width": b[1] - b[0]}
+                for b in bounds
+            ]
+        except Exception as e:
+            adv["warnings"].append(f"分段失败: {e}")
+            bounds = []
+
+    # ---- 分位数回归（供参考，不改变经典结果）----
+    # quantile_fit 的第一个参数是 points 而不是 (xs, ys)，
+    # 早期误传 xs/ys 导致 "got multiple values for argument 'tau'" ——
+    # 因为第二个位置参数 degree 被占用后，tau 又按关键字重复传入。
+    try:
+        # select_degree 可能给出 0（R² 无提升时选常数模型），
+        # 而 quantile_fit 要求 degree >= 1，故这里保底取 1。
+        qr = ba.quantile_fit(page.points, max(1, int(eff_degree)), tau=tau)
+        adv["quantile"] = {
+            "tau": tau,
+            # 字段名是 iters（不是 converged_iterations）——
+            # 早期按错名字读，让整个分位数结果被 except 吞掉。
+            "iters": int(qr.iters or 0),
+            "converged": bool(qr.converged),
+            "coefficients": list(qr.coefficients),
+            "r2": qr.r2,
+            "rmse": qr.rmse,
+        }
+    except Exception as e:
+        adv["warnings"].append(f"分位数回归未纳入结果: {e}")
+
+    # ---- Bootstrap 置信带 ----
+    boot = None
+    gpu_backend = None
+    if n_boot > 0:
+        if use_gpu:
+            # 惰性导入：import torch 要几百 ms，且 torch 本身几百 MB。
+            # 内核启动路径上绝不能碰它，否则每次开机都为 99% 用不到的
+            # 功能付启动代价。只在用户显式勾选 GPU 时才加载。
+            try:
+                import gpu_backend as gb
+                gpu_backend = gb.make_backend(use_gpu=True)
+                if gpu_backend is None:
+                    adv["warnings"].append(
+                        "GPU 不可用（未检测到 CUDA 设备或未安装 torch），已改用 CPU")
+            except Exception as e:
+                adv["warnings"].append(f"GPU 后端加载失败，改用 CPU: {e}")
+                gpu_backend = None
+        x_from = bounds[0][0] if bounds else min(xs)
+        x_to = bounds[-1][1] if bounds else max(xs)
+        try:
+            boot = ba.bootstrap_band(
+                page.points,
+                n_segments=max(2, len(bounds)) if bounds else n_seg,
+                degree=eff_degree,
+                n_boot=n_boot,
+                alpha=alpha,
+                x_from=x_from,
+                x_to=x_to,
+                seed=seed,
+                gpu=gpu_backend,
+            )
+            adv["bootstrap"] = {
+                "n_boot": boot.n_boot,
+                "alpha": boot.alpha,
+                "backend": boot.backend,
+                "n_fail": boot.n_fail,
+                "summary": boot.summary(),
+                "xs": list(boot.xs),
+                "lower": list(boot.lower),
+                "center": list(boot.center),
+                "upper": list(boot.upper),
+            }
+            adv["gpu_used"] = (boot.backend == "gpu")
+        except Exception as e:
+            adv["warnings"].append(f"Bootstrap 失败: {e}")
+
+    # ---- 经典结果照常返回，保证前端三种模式之外的第四条路径也能画图 ----
+    try:
+        base = bf.band_fit(page.points, n_segments=len(bounds) or n_seg,
+                           degree=eff_degree)
+    except Exception as e:
+        raise KernelError(f"拟合失败: {e}")
+
+    with _lock:
+        page.last_result = _pack_band_result(base)
+        page.touch()
+
+    result = dict(page.last_result)
+    result["algorithm"] = "advanced"
+    result["advanced"] = adv
     return _ok({"result": result})
 
 
@@ -799,6 +1027,7 @@ ROUTES = {
     "/api/get_points": handle_get_points,
     "/api/band_fit": handle_band_fit,
     "/api/band_fit_improved": handle_band_fit_improved,
+    "/api/band_fit_advanced": handle_band_advanced,
     "/api/poly_fit": handle_poly_fit,
     "/api/import_table": handle_import_table,
     "/api/dev_series": handle_dev_series,

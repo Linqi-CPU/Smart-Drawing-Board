@@ -31,7 +31,11 @@
 │   ├── server.py       HTTP 服务，内核唯一对外接口（ROUTES 表分发）
 │   ├── client.py       UI 侧轻量客户端（只用标准库 urllib）
 │   ├── band_fit.py     分段包络估计算法
-│   ├── fitting.py      多项式 / 多变量最小二乘
+│   ├── band_advanced.py 进阶算法：quantile_fit 分位数回归 / bootstrap_band 置信带 /
+│   │                     adaptive_segments 自适应分段 / select_degree AIC-BIC 选阶
+│   ├── fitting.py      多项式 / 多变量最小二乘（Legendre 正交基）
+│   ├── gpu_backend.py  可选 GPU 后端（Bootstrap 加速，与 CPU 逐位一致）
+│   ├── deps.py         可选依赖管理（检测 → 下载 → 离线包 + SHA256 校验）
 │   ├── data_import.py  Excel / CSV / TSV / TXT 解析
 │   ├── graph_engine.py 函数采样、自适应缩放、折线长度
 │   └── custom_loader.py 自定义函数安全加载（AST 白名单）
@@ -41,8 +45,11 @@
 │   ├── __main__.py     页面进程入口（detached 启动）
 │   └── page.py         BandPage：分段包络估计趋势与离散分析页面
 │
-└── tests/              346 项测试
+└── tests/              514 项测试
 ```
+
+注意 `core/` 里三个新模块都遵守**可选依赖**约定：`gpu_backend` 与 `deps`
+都不在 `core/__init__.py` 的 import 路径上被强制加载，缺 torch 时走 CPU 回落。
 
 ### 进程层次
 
@@ -243,6 +250,8 @@ D:\.hermes_kernel\
 | `/api/get_points` | 取点集 |
 | `/api/import_table` | 导入 Excel/CSV，解析表头数据名 |
 | `/api/band_fit` | 分段包络估计 |
+| `/api/band_fit_improved` | 改进版估计算法（中位数切分 + 全量点直接拟合） |
+| `/api/band_advanced` | 进阶分析：分位数回归 / Bootstrap / 自适应分段 / 自动选阶 |
 | `/api/poly_fit` | 普通多项式最小二乘 |
 | `/api/band_series` | 上下界包络序列 |
 | `/api/dev_series` | 离散宽度序列 |
@@ -291,20 +300,26 @@ KernelClientError: degree 必须在 0 ~ 20 之间，收到 99
 ## 11. 测试
 
 ```bash
-python -m unittest discover -s tests        # 309 项
+python -m unittest discover -s tests        # 514 项（26 项 skip）
 ```
 
 | 文件 | 内容 |
 |------|------|
 | `test_band_fit.py` | 包络估计算法 |
-| `test_fitting.py` | 多项式 / 多变量拟合 |
+| `test_band_advanced.py` | 进阶四算法：分位数回归 / Bootstrap / 自适应分段 / AIC-BIC |
+| `test_fitting.py` | 多项式 / 多变量拟合（含 Legendre 正交基） |
+| `test_high_order_numerics.py` | 高阶拟合数值精度边界 |
+| `test_gpu_consistency.py` | GPU 与 CPU 后端逐位一致 |
 | `test_data_import.py` | Excel/CSV 解析 |
 | `test_graph_engine.py` | 采样 / 缩放 / 折线长度 |
 | `test_gui_smoke.py` | 主 UI 冒烟（真实建窗口驱动） |
 | `test_fit_gui.py` | 拟合界面 |
+| `test_band_page_ui.py` | Band 页面进阶选项与摘要渲染 |
 | `test_excel_gui.py` | Excel 导入界面 |
 | `test_kernel_integration.py` | 内核 HTTP 端到端 |
 | `test_lifecycle.py` | 关闭回收 + 产物目录分类 |
+
+skip 的 26 项均为无显示环境下的 GPU 一致性测试，属预期行为。
 
 集成测试需要内核在跑：
 
@@ -329,3 +344,5 @@ python -m unittest tests.test_kernel_integration tests.test_lifecycle
 - **`dev_series` 在区间退化时返回空数组**：`x_from >= x_to` 时 `band_series` 直接早退，返回空。这是正确的边界行为，调用方需自行处理空结果。
 - **最后一个 Tk 根窗口 destroy 后 Tcl 解释器未必立刻消失**：`winfo_exists()` 仍可能返回 1。断言关闭状态时，用自己维护的标志（`_closing_down`）+ Tk 的 `after info` 队列，**不要依赖 `winfo_*` 报错**。
 - **产物清理依赖 session_id 命名**：`_sweep_orphan_files` 只认 `band_p_*` / `report_p_*`。新增产物类型时，确保文件名带 `_p_` + sid，否则重启后不会被自动清理。
+- **拟合阶数上限实际是 8 阶，不是 10 阶**：`_denormalize` 需要除 `scale^j`，而 `scale=50` 时 10 阶的 `scale^10 = 9.77e16` 已超过 `2^53`（double 尾数只有约 15.95 位）。实测 x 空间系数误差 8 阶 5.5e-04、10 阶 1.567（完全失控）。**这是 double 浮点的物理极限，不是实现缺陷**——Legendre 正交基修复的是 t 空间条件数（8 阶从 4.0e-05 改善到 2.8e-09），x 空间的除数是另一堵墙。已验证埃尔米特插值与切比雪夫基同样无效（三者同量级，最好情况反而略差）。突破需要换成 decimal 全程高精度或分段低阶拟合，属算法重设计。
+- **`adaptive_segments` 的 `max_segments` 约束的是细分后的段数**：第一阶段固定用 `base_segments`（默认 4）等分位段，第二阶段才按离散度二分。若把它理解为总段数上限，会与实际行为不符。

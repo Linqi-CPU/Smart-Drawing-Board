@@ -20,19 +20,25 @@ from edit import page
 class TestAlgoI18n(unittest.TestCase):
     """显示名 ↔ 内部 key 的映射规则。"""
 
-    def test_three_labels_map_to_distinct_keys(self):
-        """三个中文显示名必须是三个不同算法，不能有撞车。"""
+    def test_labels_map_to_distinct_keys(self):
+        """中文显示名必须互不重复（不能有两个 key 共用同一显示名）。"""
         keys = list(page.ALGO_LABELS)
         self.assertEqual(len(keys), len(set(keys)))
-        self.assertEqual(keys, ["classic", "improved", "compare"])
+        labels = list(page.ALGO_LABELS.values())
+        self.assertEqual(len(labels), len(set(labels)))
 
     def test_display_list_matches_labels(self):
-        """下拉框显示列表必须与映射表同源同序。"""
+        """下拉框显示列表必须与映射表同源同序。
+
+        不断言具体数量：新增算法（如「进阶算法」）时这个测试应继续成立。
+        真正的不变量是「ALGO_DISPLAY 里的每一项都来自 ALGO_LABELS，
+        且顺序一致」。
+        """
         self.assertEqual(
             page.ALGO_DISPLAY,
-            [page.ALGO_LABELS[k] for k in ("classic", "improved", "compare")],
+            [page.ALGO_LABELS[k] for k in page.ALGO_LABELS],
         )
-        self.assertEqual(len(set(page.ALGO_DISPLAY)), 3)
+        self.assertEqual(len(set(page.ALGO_DISPLAY)), len(page.ALGO_LABELS))
 
     def test_chinese_name_resolves_to_key(self):
         for key, label in page.ALGO_LABELS.items():

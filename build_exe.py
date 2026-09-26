@@ -98,6 +98,44 @@ def _prepare_release_dir() -> None:
     _RELEASE.mkdir(parents=True, exist_ok=True)
 
 
+def _core_hidden_imports() -> List[str]:
+    """自动扫描 core/ 下所有模块，生成 --hidden-import 列表。
+
+    为什么不用手写列表：早前只列了 core / core.server / core.session /
+    edit / edit.page 五个，新增 band_advanced / gpu_backend / deps 时
+    忘了同步，结果本地 `python -m` 一切正常，exe 里 import 直接崩。
+
+    PyInstaller 的静态分析对**运行期条件 import** 漏检率很高
+    （gpu_backend 的 try/except 回落、deps 的按需 import 都在此列），
+    所以 core/ 下的模块一律显式列出。扫描而非手列，加模块不再漏。
+
+    子包（core/xxx/ 目录）会递归展开为 core.xxx.yyy。
+    """
+    core_dir = _HERE / "core"
+    if not core_dir.is_dir():
+        return ["--hidden-import=core"]
+
+    out: List[str] = ["--hidden-import=core"]
+
+    def _walk(pkg_dir: Path, prefix: str) -> None:
+        for entry in sorted(pkg_dir.iterdir()):
+            if entry.name.startswith(("_", ".")):
+                continue
+            if entry.name == "__pycache__":
+                continue
+            if entry.is_dir():
+                if (entry / "__init__.py").exists():
+                    mod = f"{prefix}.{entry.name}"
+                    out.append(f"--hidden-import={mod}")
+                    _walk(entry, mod)
+                continue
+            if entry.suffix == ".py":
+                out.append(f"--hidden-import={prefix}.{entry.stem}")
+
+    _walk(core_dir, "core")
+    return out
+
+
 def _common_options() -> list[str]:
     return [
         "--noconfirm",
@@ -105,9 +143,7 @@ def _common_options() -> list[str]:
         "--onedir",
         "--windowed",
         f"--add-data={_HERE / 'functions'};functions",
-        "--hidden-import=core",
-        "--hidden-import=core.server",
-        "--hidden-import=core.session",
+        *_core_hidden_imports(),
         "--hidden-import=edit",
         "--hidden-import=edit.page",
         "--exclude-module=matplotlib",

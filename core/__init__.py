@@ -22,10 +22,13 @@ if _HERE not in sys.path:
 __all__ = [
     "fitting",
     "band_fit",
+    "band_advanced",
+    "gpu_backend",
+    "deps",
     "data_import",
     "graph_engine",
     "custom_loader",
     "session",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

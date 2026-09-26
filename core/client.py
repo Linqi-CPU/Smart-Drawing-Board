@@ -167,6 +167,39 @@ class KernelClient:
             payload["points"] = [list(p) for p in points]
         return self.post("/api/band_fit_improved", payload).get("result", {})
 
+    def band_fit_advanced(self, session_id: str,
+                          points: Optional[List[Tuple[float, float]]] = None,
+                          n_segments: int = 8, degree: int = 2,
+                          n_boot: int = 0, alpha: float = 0.05,
+                          select_degree: bool = False,
+                          adaptive: bool = False,
+                          quantile_tau: float = 0.5,
+                          use_gpu: bool = False,
+                          criterion: str = "bic",
+                          seed: Optional[int] = None) -> dict:
+        """进阶包络分析：分位数回归 / Bootstrap / 自适应分段 / AIC-BIC。
+
+        除 seed 外所有进阶开关都有保守默认值（全关），
+        与 server.ADV_DEFAULTS 一致 —— 不开就不做，尤其 GPU。
+        """
+        payload: Dict[str, Any] = {
+            "session_id": session_id,
+            "n_segments": n_segments,
+            "degree": degree,
+            "n_boot": n_boot,
+            "alpha": alpha,
+            "select_degree": select_degree,
+            "adaptive": adaptive,
+            "quantile_tau": quantile_tau,
+            "use_gpu": use_gpu,
+            "criterion": criterion,
+        }
+        if seed is not None:
+            payload["seed"] = seed
+        if points is not None:
+            payload["points"] = [list(p) for p in points]
+        return self.post("/api/band_fit_advanced", payload).get("result", {})
+
     def poly_fit(self, session_id: str,
                  points: Optional[List[Tuple[float, float]]] = None,
                  degree: int = 2) -> dict:

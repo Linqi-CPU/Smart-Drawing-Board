@@ -23,6 +23,7 @@ import tkinter as tk
 import threading
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Any, Dict
 
 from core.client import KernelClient, KernelClientError
 
@@ -38,11 +39,13 @@ ALGO_LABELS = {
     "classic": "经典算法",
     "improved": "改进算法",
     "compare": "对比模式",
+    "advanced": "进阶算法",
 }
 #: 下拉框显示顺序（中文），与上面的 key 一一对应
 ALGO_DISPLAY = [ALGO_LABELS["classic"],
                 ALGO_LABELS["improved"],
-                ALGO_LABELS["compare"]]
+                ALGO_LABELS["compare"],
+                ALGO_LABELS["advanced"]]
 #: 中文显示名 → 内部 key，供 _algo_key() 反查
 _ALGO_KEYS = {v: k for k, v in ALGO_LABELS.items()}
 DEFAULT_ALGO = "classic"
@@ -197,6 +200,20 @@ class BandPage:
                                state="readonly", width=8)
         algo_cb.grid(row=3, column=1, sticky=tk.E)
         algo_cb.set(ALGO_LABELS[DEFAULT_ALGO])
+        # 联动：切到「进阶算法」才展开进阶参数区。
+        # 用 bind 而不是 command，Combobox 的 state="readonly"
+        # 下 command 不会在鼠标选择时触发。
+        algo_cb.bind("<<ComboboxSelected>>", self._sync_adv_visibility)
+
+        # ---- 进阶算法参数（仅「进阶算法」用到）----
+        # 用一个可折叠的 LabelFrame 装着：三种经典模式完全不看这些值，
+        # 常驻展开只会让界面变噪音。选到「进阶算法」时自动展开。
+        self.adv_frame = ttk.LabelFrame(params, text="进阶参数")
+        self.adv_frame.grid(row=4, column=0, columnspan=2, sticky=tk.EW,
+                            pady=(6, 0))
+        self._build_adv_controls(self.adv_frame)
+        # 默认 classic：进阶区先收起来
+        self._sync_adv_visibility()
 
         params.columnconfigure(1, weight=1)
 
@@ -422,6 +439,104 @@ class BandPage:
                                  parent=self.root)
 
     # --------------------------------------------------------------
+    # 进阶算法控件
+    # --------------------------------------------------------------
+    def _build_adv_controls(self, parent) -> None:
+        """构造「进阶参数」区的控件。
+
+        GPU 开关**默认关闭**，且勾选时给出明确说明：
+          项目承诺零第三方依赖、Release 解压即用，而 torch 会让
+          产物体积翻数倍。所以 GPU 是显式 opt-in，
+          点了才通过 core.deps 走「探测 → PyPI → 离线包」的安装流程。
+        """
+        self.var_select_deg = tk.BooleanVar(value=False)
+        ttk.Checkbutton(parent, text="AIC/BIC 自动选阶",
+                        variable=self.var_select_deg
+                        ).grid(row=0, column=0, columnspan=2,
+                               sticky=tk.W, pady=2)
+
+        self.var_adaptive = tk.BooleanVar(value=False)
+        ttk.Checkbutton(parent, text="自适应分段",
+                        variable=self.var_adaptive
+                        ).grid(row=1, column=0, columnspan=2,
+                               sticky=tk.W, pady=2)
+
+        ttk.Label(parent, text="Bootstrap 次数").grid(row=2, column=0,
+                                                     sticky=tk.W, pady=2)
+        self.sp_boot = ttk.Spinbox(parent, from_=0, to=2000, width=8)
+        self.sp_boot.set(0)
+        self.sp_boot.grid(row=2, column=1, sticky=tk.E)
+
+        ttk.Label(parent, text="置信水平 1-α").grid(row=3, column=0,
+                                                   sticky=tk.W, pady=2)
+        self.sp_alpha = ttk.Spinbox(parent, from_=0.01, to=0.5, increment=0.01,
+                                    width=8)
+        self.sp_alpha.set(0.05)
+        self.sp_alpha.grid(row=3, column=1, sticky=tk.E)
+
+        ttk.Label(parent, text="分位点 τ").grid(row=4, column=0,
+                                               sticky=tk.W, pady=2)
+        self.sp_tau = ttk.Spinbox(parent, from_=0.05, to=0.95, increment=0.05,
+                                  width=8)
+        self.sp_tau.set(0.5)
+        self.sp_tau.grid(row=4, column=1, sticky=tk.E)
+
+        self.var_use_gpu = tk.BooleanVar(value=False)
+        gpu_cb = ttk.Checkbutton(parent, text="GPU 加速 Bootstrap",
+                                 variable=self.var_use_gpu)
+        gpu_cb.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=2)
+        # 悬停提示：GPU 是 opt-in，且首次使用会触发安装
+        self._tooltip(gpu_cb,
+                      "默认关闭。勾选后需要额外安装 torch（约几百 MB），\n"
+                      "内核会尝试自动安装；不可用时自动回落到 CPU。\n"
+                      "仅对 Bootstrap 有加速作用（实测约 1.7 倍）。")
+
+        parent.columnconfigure(1, weight=1)
+
+    @staticmethod
+    def _tooltip(widget, text: str) -> None:
+        """给控件挂一个简单的悬停提示。"""
+        tip = None
+
+        def _enter(_):
+            nonlocal tip
+            try:
+                x = widget.winfo_rootx() + 20
+                y = widget.winfo_rooty() + widget.winfo_height() + 4
+                tip = tk.Toplevel(widget)
+                tip.wm_overrideredirect(True)
+                tip.wm_geometry(f"+{x}+{y}")
+                tk.Label(tip, text=text, justify=tk.LEFT,
+                         background="#ffffe0", foreground="#000000",
+                         relief=tk.SOLID, borderwidth=1,
+                         font=("Microsoft YaHei UI", 8)).pack()
+            except Exception:
+                tip = None
+
+        def _leave(_):
+            nonlocal tip
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+                tip = None
+
+        widget.bind("<Enter>", _enter)
+        widget.bind("<Leave>", _leave)
+
+    def _sync_adv_visibility(self, _event=None) -> None:
+        """按当前算法显示/隐藏进阶参数区。"""
+        algo = _algo_key(getattr(self, "algo_var", None) and self.algo_var.get())
+        mgr = getattr(self.adv_frame, "grid", None) if hasattr(self, "adv_frame") else None
+        if mgr is None:
+            return
+        if algo == "advanced":
+            self.adv_frame.grid()
+        else:
+            self.adv_frame.grid_remove()
+
+    # --------------------------------------------------------------
     # 参数读取
     # --------------------------------------------------------------
     def _params(self) -> dict:
@@ -436,10 +551,42 @@ class BandPage:
             except (ValueError, AttributeError):
                 return default
 
+        def _float(widget, default):
+            """读浮点参数。空值/非法值一律回落到默认，
+            不在页面侧夹紧范围（与 _int 同一策略：
+            校验交给内核，用户能看到明确报错而不是静默被改）。"""
+            try:
+                return float(widget.get())
+            except (ValueError, AttributeError):
+                return default
+
         return {
             "n_segments": _int(self.sp_seg, 8),
             "degree": _int(self.sp_deg, 1),
             "step": _int(self.sp_step, 3),
+            # ---- 进阶算法参数（仅 algorithm=advanced 时使用）----
+            # 全部有保守默认值：不开 Bootstrap 就不会慢，
+            # 不开 GPU 就不会触发 torch 安装流程。
+            "n_boot": _int(self.sp_boot, 0),
+            "alpha": _float(self.sp_alpha, 0.05),
+            "select_degree": bool(self.var_select_deg.get()),
+            "adaptive": bool(self.var_adaptive.get()),
+            "quantile_tau": _float(self.sp_tau, 0.5),
+            "use_gpu": bool(self.var_use_gpu.get()),
+            "seed": None,
+        }
+
+    @staticmethod
+    def _adv_params_from(body: Dict[str, Any]) -> Dict[str, Any]:
+        """从一段已保存的请求体（如 session 恢复）取进阶参数。"""
+        return {
+            "n_boot": int(body.get("n_boot", 0) or 0),
+            "alpha": float(body.get("alpha", 0.05) or 0.05),
+            "select_degree": bool(body.get("select_degree", False)),
+            "adaptive": bool(body.get("adaptive", False)),
+            "quantile_tau": float(body.get("quantile_tau", 0.5) or 0.5),
+            "use_gpu": bool(body.get("use_gpu", False)),
+            "seed": body.get("seed"),
         }
 
     # --------------------------------------------------------------
@@ -471,6 +618,20 @@ class BandPage:
                                                          n_segments=p["n_segments"],
                                                          degree=p["degree"])
                 self.root.after(0, lambda: self._on_compare_done(classic, improved, p))
+            elif algo == "advanced":
+                res = self.client.band_fit_advanced(
+                    self.session_id,
+                    n_segments=p["n_segments"],
+                    degree=p["degree"],
+                    n_boot=p["n_boot"],
+                    alpha=p["alpha"],
+                    select_degree=p["select_degree"],
+                    adaptive=p["adaptive"],
+                    quantile_tau=p["quantile_tau"],
+                    use_gpu=p["use_gpu"],
+                    seed=p["seed"],
+                )
+                self.root.after(0, lambda: self._on_calc_done(res, p, "advanced"))
             else:
                 res = self.client.band_fit(self.session_id,
                                            n_segments=p["n_segments"],
@@ -516,10 +677,10 @@ class BandPage:
         messagebox.showerror(APP_NAME, f"计算失败:\n{err}",
                              parent=self.root)
 
-    def _on_calc_done(self, res: dict, p: dict) -> None:
+    def _on_calc_done(self, res: dict, p: dict, algo: str = "classic") -> None:
         self.root.config(cursor="")
         self.result = res
-        self._render_text(res)
+        self._render_text(res, algo)
         self._fill_tree(res)
         self._set_status(f"计算完成 | {res['expression']}")
 
@@ -530,7 +691,65 @@ class BandPage:
         except Exception as e:
             self._set_status(f"曲线绘制失败: {e}")
 
-    def _render_text(self, res: dict) -> None:
+    def _render_advanced_summary(self, res: dict, lines: list) -> None:
+        """把 advanced 子字典渲染成若干行，追加到 lines。
+
+        放在 try 里跑：渲染摘要失败不该让整个结果变空白 ——
+        经典那部分（走势/离散度）才是主菜。
+        """
+        adv = res.get("advanced") or {}
+        if not adv:
+            return
+
+        lines += ["", "─" * 34, "进阶分析"]
+
+        sel = adv.get("selection") or {}
+        if sel:
+            lines += [
+                f"  自动选阶: {sel.get('criterion', '')} 选中 "
+                f"{sel.get('best_degree')} 阶",
+                "  候选: " + "  ".join(
+                    f"{c.get('degree')}阶(AIC {c.get('aic'):.1f}/"
+                    f"BIC {c.get('bic'):.1f})"
+                    for c in sel.get("candidates", [])
+                    if c.get("aic") is not None
+                ) or "  （无）",
+            ]
+        else:
+            lines.append(f"  实际阶数: {adv.get('effective_degree')}")
+
+        lines.append(f"  分段策略: {adv.get('segment_strategy')}"
+                     f"（{len(adv.get('segments') or [])} 段）")
+
+        q = adv.get("quantile") or {}
+        if q:
+            conv = "已收敛" if q.get("converged") else "未收敛"
+            head = (f"  分位数回归 τ={q.get('tau')}: {conv}，"
+                    f"{q.get('iters')} 次迭代")
+            if q.get("r2") is not None:
+                head += f"，R²={q['r2']:.4f}"
+            lines.append(head)
+        else:
+            lines.append("  分位数回归: 未启用")
+
+        b = adv.get("bootstrap") or {}
+        if b:
+            lines += [
+                f"  Bootstrap: {b.get('n_boot')} 次，"
+                f"置信水平 {1 - (b.get('alpha') or 0.05):.0%}",
+                f"    后端 {b.get('backend')}，失败 {b.get('n_fail')} 次",
+            ]
+        else:
+            lines.append("  Bootstrap: 未启用")
+
+        lines.append("  GPU: " + ("已启用" if adv.get("gpu_used") else "未启用"))
+
+        warns = adv.get("warnings") or []
+        if warns:
+            lines += ["", "  提示:"]
+            lines += [f"    · {w}" for w in warns]
+
+    def _render_text(self, res: dict, algo: str = "classic") -> None:
         s = res["scatter"]
         lines = [
             f"页面编号: {self.session_id}",
@@ -553,6 +772,13 @@ class BandPage:
         ]
         if res.get("caution"):
             lines += ["", f"注意: {res['caution']}"]
+
+        if algo == "advanced":
+            try:
+                self._render_advanced_summary(res, lines)
+            except Exception:
+                # 摘要渲染失败不能吃掉主结果，最多丢一小段信息
+                pass
 
         self.result_text.delete("1.0", tk.END)
         self.result_text.insert(tk.END, "\n".join(lines))
