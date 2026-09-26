@@ -58,7 +58,7 @@ jobs:
         with:
           name: SmartDrawingBoard-Windows
           path: |
-            release/*.zip
+            release/SmartDrawingBoard-Windows.zip
           retention-days: 14
           compression-level: 9
           if-no-files-found: error
@@ -71,7 +71,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            release/*.zip
+            release/SmartDrawingBoard-Windows.zip
           generate_release_notes: true
           draft: false
           prerelease: false
