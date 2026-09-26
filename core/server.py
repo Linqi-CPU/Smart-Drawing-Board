@@ -32,6 +32,7 @@ POST /api/note                      页面回传一条消息
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import sys
@@ -335,6 +336,7 @@ def handle_band_advanced(body):
     # ---- AIC/BIC 自动选阶 ----
     eff_degree = degree
     if select_degree:
+        page.set_progress(0, 100, phase="select_degree")
         try:
             sel = ba.select_degree(
                 page.points,
@@ -360,6 +362,7 @@ def handle_band_advanced(body):
     # ---- 分段（自适应 or 等宽）----
     bounds = None
     if adaptive:
+        page.set_progress(0, 100, phase="segments")
         try:
             seg = ba.adaptive_segments(
                 xs, ys,
@@ -436,6 +439,9 @@ def handle_band_advanced(body):
                 x_to=x_to,
                 seed=seed,
                 gpu=gpu_backend,
+                # 进度落到页面状态，UI 轮询 /api/pages 后渲染进度条
+                on_progress=lambda done, total: page.set_progress(
+                    done, total, phase="bootstrap"),
             )
             adv["bootstrap"] = {
                 "n_boot": boot.n_boot,
@@ -453,20 +459,41 @@ def handle_band_advanced(body):
             adv["warnings"].append(f"Bootstrap 失败: {e}")
 
     # ---- 经典结果照常返回，保证前端三种模式之外的第四条路径也能画图 ----
+    # 用 try/finally 包住：任何路径退出（包括抛 KernelError）都必须
+    # 清掉进度。早前把 clear_progress() 放在函数尾部，一旦
+    # band_fit 抛错就直接 raise，进度永远停在 active ——
+    # UI 的进度条会一直转，用户以为还在算。
     try:
-        base = bf.band_fit(page.points, n_segments=len(bounds) or n_seg,
-                           degree=eff_degree)
-    except Exception as e:
-        raise KernelError(f"拟合失败: {e}")
+        try:
+            base = bf.band_fit(page.points,
+                               n_segments=len(bounds) or n_seg,
+                               degree=eff_degree)
+        except Exception as e:
+            raise KernelError(f"拟合失败: {e}")
 
-    with _lock:
-        page.last_result = _pack_band_result(base)
-        page.touch()
+        with _lock:
+            page.last_result = _pack_band_result(base)
+            page.touch()
 
-    result = dict(page.last_result)
-    result["algorithm"] = "advanced"
-    result["advanced"] = adv
-    return _ok({"result": result})
+        result = dict(page.last_result)
+        result["algorithm"] = "advanced"
+        result["advanced"] = adv
+        # 告诉用户实际用了哪个后端。并行生效与否可从
+        # backend 看出来：串行是 "cpu"，多进程是 "cpu-parallel"。
+        # 用户等了两分钟，有权知道机器有没有真的在干活。
+        result["advanced"]["boot_backend"] = (
+            "cpu-parallel" if (adv.get("bootstrap")
+                               and adv["bootstrap"].get("backend") == "cpu"
+                               and n_boot >= ba.PARALLEL_MIN_BOOTSTRAP)
+            else (adv.get("bootstrap") or {}).get("backend", "cpu"))
+        return _ok({"result": result})
+    finally:
+        # 计算结束（成功或失败），进度清零。不清的话 UI 的进度条
+        # 会停在满格或一直转，用户会以为还在跑。
+        page.clear_progress()
+        # 子进程池是缓存复用的，不必也不该在这里关 ——
+        # 关了下次 bootstrap 又要付一次 spawn 开销。
+        # 只在进程退出时由 atexit 收尾（见 _register_atexit）。
 
 
 def _pack_band_result(r: bf.BandFitResult) -> dict:
@@ -1276,14 +1303,64 @@ def _job_info() -> str:
         return f"job-unknown({type(e).__name__})"
 
 
+def _setup_debug_logging(flag: Optional[str]) -> None:
+    """按开关决定是否开启执行过程日志。
+
+    开关来源，优先级从高到低：
+      1. HERMES_DEBUG_LOG=<path>   显式指定文件
+      2. HERMES_DEBUG_LOG=1        自动路径
+      3. --debug=<path> 或 --debug
+    都没给 = 关闭，且关闭态零成本（debug_log 里空转）。
+
+    为什么环境变量排最前：spawn 出来的 bootstrap 子进程看不到
+    命令行参数，但继承环境变量。少了这一条，父进程开日志、
+    子进程静默，"为什么慢"就只能看到上半场。
+    """
+    import debug_log
+
+    env_path = os.environ.get("HERMES_DEBUG_LOG", "").strip()
+    if env_path:
+        if env_path.lower() in ("0", "false", "no", "off"):
+            debug_log.debug.disable()
+            return
+        try:
+            target = Path(env_path) if env_path.lower() != "1" else None
+            p = debug_log.debug.enable(path=target)
+            print(f"[kernel] debug log -> {p}", flush=True)
+        except Exception as e:
+            print(f"[kernel] debug log 开启失败（不影响计算）: {e}",
+                  flush=True)
+        return
+
+    if flag is None:
+        debug_log.debug.disable()
+        return
+    try:
+        target = Path(flag) if flag.strip() else None
+        p = debug_log.debug.enable(path=target)
+        print(f"[kernel] debug log -> {p}", flush=True)
+    except Exception as e:
+        # 日志是观察性的，开不了也不能让内核起不来
+        print(f"[kernel] debug log 开启失败（不影响计算）: {e}",
+              flush=True)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Hermes 计算内核 HTTP 服务")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default=DEFAULT_HOST)
+    # debug 日志开关。环境变量优先，因为 spawn 出来的子进程
+    # 看不到命令行（它被 multiprocessing 接管，走的是自己的通道），
+    # 父进程设的环境变量却能继承过去 —— 这样"这次算到底
+    # 走了并行还是回落串行"在子进程侧也有记录。
+    ap.add_argument("--debug", nargs="?", const="", default=None,
+                    help="开启执行过程日志，可带路径")
     args = ap.parse_args(argv)
 
     if _HERE not in sys.path:
         sys.path.insert(0, _HERE)
+
+    _setup_debug_logging(args.debug)
 
     # 死亡取证：先装钩子，后面的崩溃/被杀才有证据
     _install_death_logger(args.port)
@@ -1301,6 +1378,11 @@ def main(argv=None) -> int:
     t.daemon = True
     t.start()
 
+    # Bootstrap 并行的子进程池是模块级缓存的（复用免 spawn 开销），
+    # 但退出时不关就会留下僵尸子进程 —— 内核 main() 正常结束、
+    # 被 SIGTERM、或 finally 里的路径都要收干净。
+    atexit.register(ba.shutdown_parallel_pool)
+
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"[kernel] listening on http://{args.host}:{args.port}")
@@ -1317,4 +1399,18 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    # Windows + spawn 的必需项。band_advanced._parallel_fit 用
+    # mp.get_context("spawn") 起子进程，spawn 的方式是**重新执行
+    # 当前 exe**（不是 python 解释器）并把子进程入口传进来。
+    #
+    # 没有 freeze_support() 时，spawn 出来的子进程会重新跑一遍
+    # main()：起服务、建端口、再 spawn —— 无限递归，或者更糟：
+    # 抢占了主内核的 8765 端口，让 UI 连到"子进程版内核"。
+    # 这类故障只在你机器上是好的，打到 exe 里才现形。
+    #
+    # freeze_support() 必须在**最开头**执行：它检测自己是不是
+    # 被 spawn 的子进程，如果是就直接进入 multiprocessing 的
+    # 子进程逻辑并 sys.exit，永不返回。
+    import multiprocessing
+    multiprocessing.freeze_support()
     raise SystemExit(main())
