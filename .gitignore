@@ -1,3 +1,24 @@
+# ---------- GPU 离线包 ----------
+# 不进 git。原因是一条硬约束：GitHub 单文件上限 100MB，
+# cu126 版 torch 是 2.59 GiB，push 会被直接拒绝；LFS 免费档
+# 1GB 存储也装不下，而且要所有 clone 的人白付 2.4GB 流量。
+#
+# 走 Release Assets：`release/SmartDrawingBoard-GPU-Offline-CUDA126.zip`
+# 由 build_exe.py 生成，用户按需下载。clone 后跑
+#     python tools/fetch_gpu_wheels.py
+# 即可把 vendor/gpu/ 补齐到与 spec 登记的 sha256 一致的状态。
+vendor/gpu/*.whl
+vendor/gpu/*.WHL
+# README 是例外：它不进忽略名单，说明"这里该放什么、为什么不入库"
+!vendor/gpu/README.md
+# 本地日志/校验输出
+vendor/**/*.sha256
+
+# release/ 下的 zip 同样是产物，尤其 GPU zip 有 2.4 GiB。
+# 由 build_exe.py 生成、由 release 流程上传，不该进版本库
+# —— 一旦 git add 进去，push 会被 GitHub 100MB 限制直接拒绝。
+release/
+
 # ---------- Python ----------
 __pycache__/
 *.py[cod]
