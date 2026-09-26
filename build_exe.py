@@ -99,17 +99,26 @@ def _prepare_release_dir() -> None:
 
 
 def _core_hidden_imports() -> List[str]:
-    """自动扫描 core/ 下所有模块，生成 --hidden-import 列表。
+    """扫描 core/ 下所有模块，生成 --hidden-import 列表。
 
-    为什么不用手写列表：早前只列了 core / core.server / core.session /
-    edit / edit.page 五个，新增 band_advanced / gpu_backend / deps 时
-    忘了同步，结果本地 `python -m` 一切正常，exe 里 import 直接崩。
+    两个坑（都是实测踩出来的）：
 
-    PyInstaller 的静态分析对**运行期条件 import** 漏检率很高
-    （gpu_backend 的 try/except 回落、deps 的按需 import 都在此列），
-    所以 core/ 下的模块一律显式列出。扫描而非手列，加模块不再漏。
+    1) **core/ 内部用扁平 import**（`import fitting as ft`，
+       不是 `from core import fitting`），靠 core/__init__.py 把本目录
+       插到 sys.path[0] 实现。所以 hidden-import 必须用**不带前缀的
+       扁平名**：写 `core.fitting` 的话 PyInstaller 会按包名去找，
+       与运行时真正 import 的 `fitting` 对不上，exe 里 ImportError。
+       两种名字都列，双保险。
 
-    子包（core/xxx/ 目录）会递归展开为 core.xxx.yyy。
+    2) **torch 会被 hook-torch.py 拖进来**：gpu_backend.py 里
+       `import torch` 是函数内延迟 import（GPU 不可用时根本不会执行），
+       但 PyInstaller 的静态分析穿透函数体，触发 hook-torch，
+       连带 hook-cv2 / hook-transformers / hook-av / hook-lxml，
+       把整个 ML 生态塞进 exe，体积翻数十倍。
+       上面 --exclude-module=torch 就是为这个，见 gpu_backend.py 的
+       设计注释（零第三方依赖）。
+
+    扫描而非手列，加模块不再漏。
     """
     core_dir = _HERE / "core"
     if not core_dir.is_dir():
@@ -125,12 +134,12 @@ def _core_hidden_imports() -> List[str]:
                 continue
             if entry.is_dir():
                 if (entry / "__init__.py").exists():
-                    mod = f"{prefix}.{entry.name}"
-                    out.append(f"--hidden-import={mod}")
-                    _walk(entry, mod)
+                    _walk(entry, f"{prefix}.{entry.name}")
                 continue
             if entry.suffix == ".py":
-                out.append(f"--hidden-import={prefix}.{entry.stem}")
+                stem = entry.stem
+                out.append(f"--hidden-import={stem}")       # 扁平名，运行时用的
+                out.append(f"--hidden-import={prefix}.{stem}")  # 包名，双保险
 
     _walk(core_dir, "core")
     return out
@@ -150,6 +159,16 @@ def _common_options() -> list[str]:
         "--exclude-module=numpy",
         "--exclude-module=pandas",
         "--exclude-module=PIL",
+        # gpu_backend 的 `import torch` 是函数内延迟 import，但 PyInstaller
+        # 静态分析穿透函数体，会触发 hook-torch 并连带 cv2/transformers/av/lxml，
+        # 把整个 ML 生态打进 exe（体积数十倍）。GPU 路径本就设计为可选，
+        # 缺 torch 时自动回落 CPU，故这里必须排除。
+        "--exclude-module=torch",
+        "--exclude-module=torchvision",
+        "--exclude-module=torchaudio",
+        "--exclude-module=cv2",
+        "--exclude-module=transformers",
+        "--exclude-module=av",
         "--exclude-module=tkinter.test",
         "--distpath",
         str(_DIST),
