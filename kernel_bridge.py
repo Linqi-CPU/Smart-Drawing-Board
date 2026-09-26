@@ -33,6 +33,15 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# 子进程启动：源码模式用解释器+脚本，exe 模式用同目录 exe。
+# 两种形态的判断收敛在这一处，launcher / kernel_bridge 共用。
+# core/spawn.py 在子目录，这里显式把 core/ 加进 sys.path 再扁平 import，
+# 与 core/ 内部一致的扁平风格（core/__init__.py 也是这么自举的）。
+_CORE_DIR = Path(__file__).resolve().parent / "core"
+if _CORE_DIR.is_dir() and str(_CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(_CORE_DIR))
+import spawn  # noqa: E402
+
 #: 项目根目录（本文件所在目录）
 ROOT = Path(__file__).resolve().parent
 
@@ -95,13 +104,16 @@ def start_kernel(port: int = DEFAULT_PORT) -> Tuple[bool, str]:
         startupinfo.wShowWindow = 0  # SW_HIDE
 
     log = ROOT / ".kernel.log"
+    argv = spawn.resolve_argv("kernel", ["--port", str(port)])
+    if argv is None:
+        return False, spawn.missing_message("kernel")
     try:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(f"\n--- start kernel {time.strftime('%F %T')} ---\n")
+            fh.write("argv: %r\n" % (argv,))
             fh.flush()
             subprocess.Popen(
-                [_python_exe(), "-u", str(KERNEL_ENTRY),
-                 "--port", str(port)],
+                argv,
                 cwd=str(ROOT),
                 stdout=fh,
                 stderr=subprocess.STDOUT,
@@ -131,18 +143,18 @@ def launch_page(page: str = "band", port: int = DEFAULT_PORT,
     """
     if page not in LAUNCHERS:
         return False, f"未知页面 '{page}'，可用: {', '.join(LAUNCHERS)}"
-    if not PAGE_ENTRY.exists():
-        return False, f"找不到页面入口: {PAGE_ENTRY}"
+    argv = spawn.resolve_argv(
+        "page", ["--page", page, "--port", str(port)])
+    if argv is None:
+        return False, spawn.missing_message("page")
+    if session_id:
+        argv += ["--session-id", session_id]
 
     alive, msg = start_kernel(port)
     if not alive and not kernel_alive(port):
         return False, f"内核未就绪: {msg}"
 
-    cmd = [_python_exe(), "-u", str(PAGE_ENTRY),
-           "--page", page,
-           "--port", str(port)]
-    if session_id:
-        cmd += ["--session-id", session_id]
+    cmd = argv
 
     creationflags = 0
     startupinfo = None

@@ -47,6 +47,7 @@ if str(_HERE) not in sys.path:
 import kernel_bridge as kb          # noqa: E402
 from kernel_bridge import (DEFAULT_HOST, DEFAULT_PORT, LAUNCHERS,  # noqa: E402
                            kernel_alive, list_pages)
+import spawn                        # noqa: E402  子进程启动（源码/exe 双形态）
 
 APP_NAME = "智能绘图板 · 启动器"
 APP_VERSION = "1.0.0"
@@ -169,7 +170,11 @@ class LauncherApp:
 
     def _launch(self, key: str) -> None:
         if key == "__main__":
-            self._spawn("main", [sys.executable, "-u", str(MAIN_ENTRY)])
+            argv = spawn.resolve_argv("main")
+            if argv is None:
+                self._toast(f"启动失败：{spawn.missing_message('main')}")
+                return
+            self._spawn("main", argv)
             return
         if key.startswith("page:"):
             page = key.split(":", 1)[1]

@@ -20,12 +20,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import build_exe as be
 
-EXPECTED_RELEASE = [
-    "SmartDrawingBoard-Launcher.zip",
-    "SmartDrawingBoard-Main.zip",
-    "SmartDrawingBoard-Page.zip",
-    "SmartDrawingBoard-Source.zip",
-]
+EXPECTED_RELEASE = sorted(["SmartDrawingBoard-Windows.zip",
+                           "SmartDrawingBoard-Source.zip"])
+#: 成品 zip 固定 1 个 —— 四个 exe 打进同一个 zip，
+#: 因为解压后必须同目录才能互相拉起
+N_BINARY_ZIPS = 1
 
 
 class PackFixture(unittest.TestCase):
@@ -140,39 +139,73 @@ class TestSourceZipFallback(PackFixture):
         )
 
 
-class TestBinaryZips(PackFixture):
-    """成品 zip 必须解压即见 exe，不能多套一层目录。"""
+def _make_fake_bundle() -> Path:
+    """造一个合并后的 bundle 目录（构建产物应有的形态）。
 
-    def _make_fake_dists(self):
-        for name, _script in be.APP_ENTRIES:
-            d = be._DIST / name
-            (d / "core").mkdir(parents=True, exist_ok=True)
-            (d / f"{name}.exe").write_bytes(b"MZ fake")
-            (d / "core" / "server.py").write_text("# srv", encoding="utf-8")
+    模块级函数而非测试类方法，因为 TestBinaryZips 与
+    TestReleaseDirContents 都要用。故意不造四个平级目录 ——
+    那是旧布局，Launcher 用它找 Page 会报「找不到入口」，
+    用户已经实际踩过这个坑。
+    """
+    d = be._DIST / be.BUNDLE_NAME
+    (d / "core").mkdir(parents=True, exist_ok=True)
+    (d / "_internal").mkdir(parents=True, exist_ok=True)
+    for name, _script in be.APP_ENTRIES:
+        (d / f"{name}.exe").write_bytes(b"MZ fake")
+    (d / "_internal" / "python311.dll").write_bytes(b"MZ dll")
+    (d / "core" / "server.py").write_text("# srv", encoding="utf-8")
+    return d
+
+
+class TestBinaryZips(PackFixture):
+    """成品 zip 必须解压即见 exe，且四个 exe 同目录。"""
 
     def test_no_extra_top_dir(self):
         self._point_module_at_fake_tree()
         be._prepare_release_dir()
-        self._make_fake_dists()
+        _make_fake_bundle()
 
-        zips = be._make_binary_zips()
-        self.assertEqual(len(zips), 3)
-        expected = sorted(f"{name}.zip" for name, _ in be.APP_ENTRIES)
-        self.assertEqual(sorted(p.name for p in zips), expected)
+        zips = be._make_binary_zip()
+        self.assertEqual(len(zips), N_BINARY_ZIPS)
 
         names = self._names(zips[0])
-        self.assertTrue(any(n.endswith(".exe") for n in names), "zip 内应有 exe")
+        exes = [n for n in names if n.endswith(".exe")]
+        # 四个 exe 必须都在 zip 根，不带目录前缀
+        self.assertEqual(len(exes), len(be.APP_ENTRIES),
+                         f"zip 里的 exe 数量不对: {exes}")
+        for name, _script in be.APP_ENTRIES:
+            self.assertIn(f"{name}.exe", names,
+                          f"zip 里缺少 {name}.exe")
         self.assertFalse(
-            any(n.startswith("SmartDrawingBoard-Launcher/") for n in names),
-            f"zip 内多了顶层目录，解压后还要再进一层: {names}",
+            any("/" in e for e in exes),
+            f"exe 不应带目录前缀，否则解压后还要再进一层: {exes}",
         )
 
-    def test_missing_dist_raises(self):
+    def test_bundle_has_shared_internal(self):
+        """bundle 里必须有一份共享的 _internal/。
+
+        四个 exe 共用同一份 Python 运行时（同代码同排除名单，内容一致），
+        分开带四份会让体积翻四倍且毫无收益。
+        """
         self._point_module_at_fake_tree()
         be._prepare_release_dir()
-        # 不造 dist，应当立刻报错而不是产出空 zip
+        _make_fake_bundle()
+        zips = be._make_binary_zip()
+        names = self._names(zips[0])
+        self.assertIn("_internal/python311.dll", names)
+        # 只应有一个 _internal/ 顶层目录（zip 里它自己也会作为一条
+        # "_internal/" 目录条目出现，所以判顶层条目而非 startswith）
+        tops = {n.split("/")[0] for n in names}
+        internal_tops = [t for t in tops if t == "_internal"]
+        self.assertEqual(len(internal_tops), 1,
+                         f"_internal/ 应只有一份: {names}")
+
+    def test_missing_bundle_raises(self):
+        self._point_module_at_fake_tree()
+        be._prepare_release_dir()
+        # 不造 bundle，应当立刻报错而不是产出空 zip
         with self.assertRaises(SystemExit):
-            be._make_binary_zips()
+            be._make_binary_zip()
 
 
 class TestReleaseDirContents(PackFixture):
@@ -183,12 +216,8 @@ class TestReleaseDirContents(PackFixture):
         self._point_module_at_fake_tree()
         be._prepare_release_dir()
         be._make_source_zip()
-
-        for name, _script in be.APP_ENTRIES:
-            d = be._DIST / name
-            d.mkdir(parents=True, exist_ok=True)
-            (d / f"{name}.exe").write_bytes(b"MZ")
-        be._make_binary_zips()
+        _make_fake_bundle()
+        be._make_binary_zip()
 
         self.assertEqual(sorted(p.name for p in be._RELEASE.iterdir()),
                          EXPECTED_RELEASE)
@@ -199,6 +228,35 @@ class TestReleaseDirContents(PackFixture):
         self.assertFalse((be._RELEASE / "Obsolete-Old.zip").exists())
         self.assertEqual(list(be._RELEASE.iterdir()), [],
                          "_prepare_release_dir 应清空整个 release/")
+
+
+    def test_all_spawn_targets_have_entries(self):
+        """core/spawn.py 声明要拉起的 exe，必须都在 APP_ENTRIES 里。
+
+        这是用户实际踩到的坑的回归守护：exe 环境下 sys.executable 是
+        exe 自己而非解释器，Launcher 只能"一个 exe 起另一个 exe"。
+        漏打一个入口，源码模式完全正常、CI 构建成功，
+        只有用户下载解压后点对应功能才报「找不到入口」。
+        """
+        core_dir = Path(be.__file__).resolve().parent / "core"
+        sys.path.insert(0, str(core_dir))
+        try:
+            import spawn as spawn_mod
+            targets = {s["exe"] for s in spawn_mod.CHILD_TARGETS.values()}
+        finally:
+            if sys.path and sys.path[0] == str(core_dir):
+                sys.path.pop(0)
+        entries = {name for name, _ in be.APP_ENTRIES}
+        self.assertEqual(
+            targets - entries, set(),
+            "APP_ENTRIES 缺少这些 exe，对应功能在 exe 里会找不到入口")
+
+    def test_kernel_entry_exists(self):
+        """内核必须是独立入口 —— 早前它不是，导致 exe 里内核起不来。"""
+        names = {name for name, _ in be.APP_ENTRIES}
+        self.assertIn("SmartDrawingBoard-Kernel", names)
+        scripts = {name: s for name, s in be.APP_ENTRIES}
+        self.assertEqual(scripts["SmartDrawingBoard-Kernel"].name, "server.py")
 
 
 class TestRepoIgnoresBuildDirs(unittest.TestCase):

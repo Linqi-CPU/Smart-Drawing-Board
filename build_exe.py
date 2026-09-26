@@ -28,7 +28,7 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 # ------------------------------------------------------------------
 # 输出编码：Windows 控制台默认 cp1252，中文 print 会直接 UnicodeEncodeError
@@ -48,10 +48,22 @@ except Exception:
 _HERE = Path(__file__).resolve().parent
 _DIST = _HERE / "dist"
 _RELEASE = _HERE / "release"
+#: 各入口的独立构建暂存区，最终会合并进 _DIST/BUNDLE_NAME
+_STAGING = _HERE / "build" / "staging"
+#: 合并后单一分发目录名 —— 用户解压 zip 后看到的唯一目录。
+#: 四个 exe（Launcher/Kernel/Main/Page）与共享的 _internal/ 都在这里面，
+#: 因为 spawn.bundle_root() 按"当前 exe 所在目录"找兄弟 exe。
+BUNDLE_NAME = "SmartDrawingBoard"
 
-#: 三个可执行入口：(产物目录名, 入口脚本)
+#: 四个可执行入口：(产物目录名, 入口脚本)
+#:
+#: 四个都必须是独立 exe，一个都不能少。原因见 core/spawn.py 的说明：
+#: exe 环境下 sys.executable 是 exe 自己而非解释器，Launcher 想拉起
+#: 内核/页面/主 UI 时只能"一个 exe 起另一个 exe"。少打一个，
+#: 对应功能在 exe 里就是"找不到入口"而源码下完全正常。
 APP_ENTRIES = [
     ("SmartDrawingBoard-Launcher", _HERE / "launcher.py"),
+    ("SmartDrawingBoard-Kernel", _HERE / "core" / "server.py"),
     ("SmartDrawingBoard-Main", _HERE / "main.py"),
     ("SmartDrawingBoard-Page", _HERE / "edit" / "__main__.py"),
 ]
@@ -82,8 +94,24 @@ def _ensure_pyinstaller() -> None:
 
 
 def _clean_dist() -> None:
-    if _DIST.exists():
+    """清空 dist/。删不动时给出可操作的提示，而不是甩 PermissionError。
+
+    Windows 下 dist/ 里的 exe 正被运行（用户开着 Launcher 调试）时，
+    rmtree 会 PermissionError。此时应告诉用户关掉哪个进程，
+    而不是让人对着一堆 traceback 猜。
+    """
+    if not _DIST.exists():
+        _DIST.mkdir(parents=True, exist_ok=True)
+        return
+    try:
         shutil.rmtree(_DIST)
+    except PermissionError as e:
+        raise SystemExit(
+            "无法清空 dist/，多半是里面的 exe 正在运行：\n"
+            f"  {e.filename or _DIST}\n"
+            "请关闭 SmartDrawingBoard-* 进程后重试。\n"
+            "（Windows 下运行中的 exe 会被文件锁占用，删不掉也覆盖不掉。）"
+        ) from e
     _DIST.mkdir(parents=True, exist_ok=True)
 
 
@@ -146,12 +174,26 @@ def _core_hidden_imports() -> List[str]:
 
 
 def _common_options() -> list[str]:
+    # core/ 必须进 --paths：core 内部是扁平 import（import fitting as ft），
+    # 靠 sys.path[0] 定位同目录模块。PyInstaller 只在源码树里能自动
+    # 追到这些扁平名，但 frozen 后它们的搜索路径来自 --paths，
+    # 少了这一项，exe 里 `import band_advanced` 直接
+    # ModuleNotFoundError —— 内核 exe 跑不起来，而 CI 仍显示构建成功。
+    core_paths = []
+    if (_HERE / "core").is_dir():
+        core_paths = ["--paths", str(_HERE / "core")]
+    edit_paths = []
+    if (_HERE / "edit").is_dir():
+        edit_paths = ["--paths", str(_HERE / "edit")]
+
     return [
         "--noconfirm",
         "--clean",
         "--onedir",
         "--windowed",
         f"--add-data={_HERE / 'functions'};functions",
+        *core_paths,
+        *edit_paths,
         *_core_hidden_imports(),
         "--hidden-import=edit",
         "--hidden-import=edit.page",
@@ -194,9 +236,85 @@ def _build_entry(name: str, script: Path) -> None:
     print(f"\n>>> Building: {name}")
     print("    Entry: " + str(script))
 
+    # 每个入口先各自构建到 _STAGING/<name>/，最后再合并进一个总目录。
+    # 为什么不直接构建到总目录：--onedir 模式下每个入口会产出
+    # 自己的一套 _internal/（Python 运行时 + 依赖），四个入口并排放进
+    # 同一目录时这些 _internal 会互相覆盖，产物直接坏掉。
+    staging = _STAGING / name
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    args += ["--distpath", str(staging)]
+
     proc = subprocess.run(args, cwd=str(_HERE))
     if proc.returncode != 0:
         raise SystemExit(f"打包失败：{name}")
+
+
+def _entry_output_dir(name: str) -> Path:
+    """某个入口的实际产出目录。
+
+    PyInstaller 的 --name=X 与 --distpath=Y 组合会在 Y/X/ 下再建一层
+    同名目录（实测：--distpath=build/staging/SmartDrawingBoard-Kernel
+    产出 build/staging/SmartDrawingBoard-Kernel/SmartDrawingBoard-Kernel/）。
+    早前按 Y/ 直接找 exe，报了"暂存产物里没有 exe"。
+    """
+    base = _STAGING / name
+    nested = base / name
+    if nested.is_dir():
+        return nested
+    return base
+
+
+def _merge_into_bundle() -> Path:
+    """把 _STAGING/ 下各入口的 exe 合并成 dist/<包名>/ 单个目录。
+
+    每个入口的 _internal/ 只保留一份：四个 exe 共享同一个 Python 运行时
+    与依赖树（版本与内容完全一致，因为同一份代码、同一份排除名单）。
+    分开保留四份会让体积翻四倍，没有任何收益。
+
+    合并后 spawn.bundle_root() 指向这里，四个 exe 天然同目录，
+    "一个 exe 起另一个 exe" 的判断直接成立。
+    """
+    bundle = _DIST / BUNDLE_NAME
+    if bundle.exists():
+        shutil.rmtree(bundle)
+    bundle.mkdir(parents=True, exist_ok=True)
+
+    internal_copied = False
+    for name, _script in APP_ENTRIES:
+        src = _entry_output_dir(name)
+        if not src.is_dir():
+            raise SystemExit(f"缺少暂存产物: {src}")
+        # exe 提升到 bundle 根
+        exe = src / f"{name}.exe"
+        if not exe.exists():
+            raise SystemExit(f"暂存产物里没有 exe: {exe}")
+        shutil.copy2(exe, bundle / exe.name)
+
+        # _internal/ 只搬第一份（四个入口的运行时内容相同）
+        src_internal = src / "_internal"
+        if src_internal.is_dir() and not internal_copied:
+            shutil.copytree(src_internal, bundle / "_internal")
+            internal_copied = True
+
+    if not internal_copied:
+        raise SystemExit("四个入口都没有产出 _internal/，打包结果不可用")
+
+    # functions/ 数据目录（如果有入口带了它，同样只保留一份）
+    for name, _script in APP_ENTRIES:
+        funcs = _entry_output_dir(name) / "functions"
+        if funcs.is_dir() and not (bundle / "functions").exists():
+            shutil.copytree(funcs, bundle / "functions")
+            break
+
+    print(f">>> 合并为单一目录: dist/{BUNDLE_NAME}/")
+    return bundle
+
+
+def _clean_staging() -> None:
+    if _STAGING.exists():
+        shutil.rmtree(_STAGING)
 
 
 # ==================================================================
@@ -266,24 +384,99 @@ def _make_source_zip() -> Path:
     return out
 
 
-def _make_binary_zips() -> List[Path]:
-    """把三个 exe 目录各自打成 zip。
+def _vendor_gpu_dir() -> Path:
+    """GPU 离线包目录（torch wheel 等）。"""
+    return _HERE / "vendor" / "gpu"
 
-    root_dir 指向目录本身，zip 内不带多余顶层目录，
-    用户解压直接看到 SmartDrawingBoard-Launcher.exe。
+
+def _copy_gpu_wheels_into_bundle(bundle: Path) -> List[str]:
+    """把 CPU 版 torch wheel 拷进 bundle 的 vendor/gpu/。
+
+    为什么只拷 CPU 版：CUDA 版约 2.4 GiB，塞进 Release 会让
+    19 MB 的 zip 变成 2.4 GB，"解压即用"这条承诺就没了。
+    CPU 版约 118 MB，可接受，且它让**任何**机器都能装 GPU 依赖
+    （只是 GPU 加速不生效，会静默回落 CPU）——
+    这正好是 deps.py 里 TORCH_CPU 的用途。
+
+    CUDA 版由 _make_gpu_offline_zip() 单独打成一个 zip，
+    不进 Release，由需要 GPU 的用户另外下载。
     """
-    outs: List[Path] = []
-    for name, _script in APP_ENTRIES:
-        src = _DIST / name
-        if not src.is_dir():
-            raise SystemExit(f"缺少打包产物: {src}")
-        out = _RELEASE / f"{name}.zip"
-        if out.exists():
-            out.unlink()
-        shutil.make_archive(str(out.with_suffix("")), "zip", root_dir=str(src))
-        outs.append(out)
-        print(f">>> Binary zip: {out.name}")
-    return outs
+    src = _vendor_gpu_dir()
+    if not src.is_dir():
+        print(f"!!! GPU 离线包目录不存在: {src}（跳过，GPU 依赖将只能联网安装）")
+        return []
+    dest = bundle / "vendor" / "gpu"
+    dest.mkdir(parents=True, exist_ok=True)
+    copied: List[str] = []
+    for whl in sorted(src.glob("*.whl")):
+        # 只带 CPU 版 + 纯 Python 依赖；CUDA 版单独分发
+        if "+cu" in whl.name or "+rocm" in whl.name:
+            continue
+        shutil.copyfile(whl, dest / whl.name)
+        copied.append(whl.name)
+    return copied
+
+
+def _make_gpu_offline_zip() -> Optional[Path]:
+    """把 CUDA 版 torch 打成单独的大 zip（不进 Release）。
+
+    单独分发的原因：2.4 GiB。GitHub Release 放得下，
+    但让它跟着 19 MB 的主包走会很荒谬 —— 99% 的用户不需要 GPU。
+    """
+    src = _vendor_gpu_dir()
+    if not src.is_dir():
+        return None
+    cuda = sorted(src.glob("torch-*+cu*.whl"))
+    deps_only = sorted(
+        p for p in src.glob("*.whl")
+        if "+cu" not in p.name and not p.name.startswith("torch-2.13.0+cpu")
+    )
+    if not cuda:
+        print("!!! 未找到 CUDA 版 torch，跳过 GPU 离线包")
+        return None
+    _RELEASE.mkdir(parents=True, exist_ok=True)
+    out = _RELEASE / "SmartDrawingBoard-GPU-Offline-CUDA126.zip"
+    if out.exists():
+        out.unlink()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in cuda + deps_only:
+            z.write(p, arcname=p.name)
+            print(f"    + {p.name}  ({p.stat().st_size / 1048576:.1f} MB)")
+    print(f">>> GPU offline zip: {out.name} "
+          f"({out.stat().st_size / 1048576:.1f} MB)")
+    return out
+
+
+def _make_binary_zip() -> Path:
+    """把合并后的整套产物打成一个 zip。
+
+    从"四个入口各自一个 zip"改为"一个 zip"：四个 exe 必须同目录才能
+    互相拉起（spawn.bundle_root 按当前 exe 所在目录找兄弟 exe），
+    分成四个 zip 的话用户解压会得到四个平级目录，Launcher 又找不到
+    Page —— 这个坑已经实际踩过一次。
+
+    root_dir 指向 bundle 目录本身，zip 内不带多余顶层目录，
+    用户解压直接看到 SmartDrawingBoard-Launcher.exe 等四个文件。
+    """
+    src = _DIST / BUNDLE_NAME
+    if not src.is_dir():
+        raise SystemExit(f"缺少合并产物: {src}")
+
+    # CPU 版 torch 随主包分发（~118 MB），断网也能装 GPU 依赖
+    wheels = _copy_gpu_wheels_into_bundle(src)
+    if wheels:
+        total = sum((src / "vendor" / "gpu" / w).stat().st_size
+                    for w in wheels)
+        print(f">>> bundle/vendor/gpu: {len(wheels)} 个 wheel "
+              f"({total / 1048576:.1f} MB)")
+
+    out = _RELEASE / f"{BUNDLE_NAME}-Windows.zip"
+    if out.exists():
+        out.unlink()
+    shutil.make_archive(str(out.with_suffix("")), "zip", root_dir=str(src))
+    print(f">>> Binary zip: {out.name} "
+          f"({out.stat().st_size / 1048576:.1f} MB)")
+    return [out]
 
 
 def _report() -> None:
@@ -297,8 +490,8 @@ def _report() -> None:
         return out
 
     print("\nBuild complete.")
-    print("  dist/ (exe dirs):")
-    for line in _rows(_DIST):
+    print(f"  dist/ (单一分发目录 {BUNDLE_NAME}/):")
+    for line in _rows(_DIST / BUNDLE_NAME):
         print(line)
     print("  release/ (zips):")
     for line in _rows(_RELEASE):
@@ -306,17 +499,59 @@ def _report() -> None:
     print()
 
 
+def _check_entry_names_match_spawn() -> None:
+    """校验 APP_ENTRIES 与 core/spawn.py 的 CHILD_TARGETS 一致。
+
+    这是硬性校验，不是提示。两处名单对不上时**直接构建失败**，
+    因为对不上的后果是静默的：源码模式一切正常，exe 里那个功能
+    "找不到入口"——用户下载解压后才能发现，而 CI 只会显示构建成功。
+    """
+    core_dir = _HERE / "core"
+    if not core_dir.is_dir():
+        return
+    sys_path_added = str(core_dir) not in sys.path
+    if sys_path_added:
+        sys.path.insert(0, str(core_dir))
+    try:
+        import spawn as spawn_mod
+        want = {spec["exe"] for spec in spawn_mod.CHILD_TARGETS.values()}
+    except Exception as e:  # pragma: no cover - 只在 spawn.py 自身坏掉时
+        raise SystemExit(f"无法读取 core/spawn.py 的 CHILD_TARGETS: {e}")
+    finally:
+        if sys_path_added and sys.path and sys.path[0] == str(core_dir):
+            sys.path.pop(0)
+
+    have = {name for name, _ in APP_ENTRIES}
+    missing = want - have
+    if missing:
+        raise SystemExit(
+            "APP_ENTRIES 缺少 core/spawn.py 声明要拉起的 exe: "
+            + ", ".join(sorted(missing))
+            + "\n这些入口不打包，对应功能在 exe 里会报「找不到入口」，"
+              "而源码模式完全正常，CI 也不会失败。")
+    print("入口名单校验通过：%d 个 exe，与 core/spawn.py 一致"
+          % len(APP_ENTRIES))
+
+
 def main() -> int:
     _ensure_pyinstaller()
     _clean_dist()
     _prepare_release_dir()
+    _check_entry_names_match_spawn()
 
     for name, script in APP_ENTRIES:
         _build_entry(name, script)
 
+    _merge_into_bundle()
+    _clean_staging()
+
     print("\n>>> Packaging release zips (源码与成品分开)")
     _make_source_zip()
-    _make_binary_zips()
+    _make_binary_zip()
+    # GPU 离线包（CUDA 版，约 2.4 GiB）单独打，不进主 Release。
+    # 只在 vendor/gpu 里确有 CUDA wheel 时才产出，
+    # 没下载过就跳过 —— 不影响主流程。
+    _make_gpu_offline_zip()
 
     _report()
     return 0
