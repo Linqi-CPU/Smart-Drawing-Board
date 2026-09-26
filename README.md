@@ -28,11 +28,13 @@
 
 前往 [Releases](../../releases) 下载最新版本，解压后直接运行：
 
-- `SmartDrawingBoard-Launcher`：启动器（推荐）
+- `SmartDrawingBoard-Launcher`：启动器（推荐，由它拉起内核与各功能）
 - `SmartDrawingBoard-Main`：主绘图板
 - `SmartDrawingBoard-Page`：独立功能页面
+- `SmartDrawingBoard-Kernel`：计算内核（HTTP 服务）
 
-无需安装 Python，解压即用。
+无需安装 Python，解压即用。**四个 exe 需放在同一目录**——启动器拉起
+内核与页面时是按同目录找对应 exe，拆开放会提示找不到入口。
 
 ### 开发者
 

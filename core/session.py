@@ -152,6 +152,31 @@ class PageState:
     pid: Optional[int] = None
     # 页面是否已请求关闭。用于内核区分"空闲页面"与"已关闭的孤儿"。
     closing: bool = False
+    # 长时间计算的进度快照，供 UI 轮询后渲染进度条。
+    # 内核跑计算、UI 是 HTTP 客户端，两边没有长连接，
+    # 所以进度只能落在页面状态里由 UI 主动来取。
+    # 结构：{"active": bool, "done": int, "total": int,
+    #        "phase": str, "at": float}
+    progress: Dict[str, Any] = field(default_factory=dict)
+
+    def set_progress(self, done: int, total: int,
+                     phase: str = "") -> None:
+        """更新进度快照。total<=0 或 done>=total 视为进行中。
+
+        线程安全：计算可能在内核的工作线程里跑（HTTP 服务是单线程，
+        但测试会直接并发调用），写入用赋值而非 read-modify-write。
+        """
+        self.progress = {
+            "active": bool(total > 0 and done < total),
+            "done": int(max(0, done)),
+            "total": int(max(0, total)),
+            "phase": str(phase or ""),
+            "at": time.time(),
+        }
+
+    def clear_progress(self) -> None:
+        self.progress = {"active": False, "done": 0, "total": 0,
+                         "phase": "", "at": time.time()}
 
     def touch(self) -> None:
         self.updated_at = time.time()
@@ -173,6 +198,7 @@ class PageState:
             "notes": list(self.notes),
             "pid": self.pid,
             "closing": self.closing,
+            "progress": dict(self.progress),
         }
 
 

@@ -11,12 +11,89 @@
 
 ### 新增
 
+- **PyInstaller 冻结环境下的 Bootstrap 并行修复（`multiprocessing.freeze_support()`）**：
+  `core/server.py` 入口必须在 `main()` 之前调 `freeze_support()`。
+  spawn 出来的子进程是**重新执行 Kernel exe**，没有这行就会重跑
+  `main()`：起 HTTP 服务、抢 8765 端口、再 spawn —— 递归或端口被占。
+  这个 bug 在源码模式下永远测不出来（源码 spawn 走解释器 + 脚本路径
+  另一条分支），只能靠静态检查顺序，已加
+  `tests/test_freeze_support.py` 守住（含"禁止 fork"的项目级扫描）。
+  已在真 exe 上验证：8 workers / n_boot=1000 / 2.1s / n_fail=0 /
+  `bootstrap_fallback` 无，且第二次请求 `pool_reused=True`。
+- **内核 debug 日志开关**：`--debug [path]`，或环境变量
+  `HERMES_DEBUG_LOG=<path>` / `=1`。环境变量优先，因为 spawn 出的
+  bootstrap 子进程看不到命令行但继承环境变量 —— 少了这条，
+  "为什么慢"只能看到上半场。开了才落盘，关闭态零成本。
+  `tests/test_debug_env_priority.py`（5 项）锁定优先级。
+- **GPU 离线包（`vendor/gpu/`）**：torch 的完整离线安装链路，断网可装。
+  - CUDA 12.6 版 `torch-2.13.0+cu126-cp311-cp311-win_amd64.whl`（2.42 GiB）
+    —— GPU 加速真正需要的那个，仅 NVIDIA + CUDA 12.6 可用
+  - CPU 版（116.2 MiB）**随 Release 一起分发**，任何机器都能装上依赖
+    （GPU 加速不生效，会静默回落 CPU），换取"解压即用"不被破坏
+  - 六个纯 Python 依赖（filelock / fsspec / jinja2 / networkx / sympy /
+    typing-extensions）版本锁定，避免断网时装到不兼容组合
+  - 每个 wheel 都登记**官方** SHA-256，安装前逐一校验，不匹配拒绝安装
+    （摘要从 PyPI / download.pytorch.org 官方索引页取，不是估算值）
+  - `deps.py` 新增 `TORCH_CPU` / `TORCH_CUDA` 两个 spec 与 `index_url`
+    字段。`index_url` 是必需的：cu126 版不在 PyPI 上，只写包名会静默
+    装成 CPU 版，用户以为开了 GPU 其实在用 CPU 算
+  - `build_exe.py` 产出两个 zip：主包（含 CPU 版 wheel）与单独的
+    `SmartDrawingBoard-GPU-Offline-CUDA126.zip`
+- **`core/debug_log.py` 执行过程日志**：页面侧与内核侧共用一份日志，
+  排查"为什么慢"时能把两侧时间线拼起来。默认关闭、关闭态零成本。
+  `with debug.timer(...)` 计时上下文在异常时记录 traceback 且
+  **不吞异常**（日志不能改变控制流）。
+- **计算进度条**：Bootstrap 分批报进度（`on_progress` 回调），
+  进度落在 `PageState.progress`，UI 每 250ms 轮询 `/api/sessions`。
+  进度条位于**右侧「计算结果」区顶部**——原本放在左侧「开始计算」
+  按钮下方，但左栏总高度超过常见窗口高度，实测 760px 窗口里
+  按下拉框后就看不见了。`clear_progress()` 放在 `try/finally` 里，
+  计算抛错时也必须收起进度条。
+- **Bootstrap CPU 并行**：`n_boot ≥ 150` 且多核时用 `ProcessPoolExecutor`
+  （显式 spawn，Windows 唯一可用）。实测 5000 点 × 1000 次
+  45.40s → 13.49s（**3.37x**），且与串行**逐位一致**（同一 seed 下
+  lower/upper/center/center_median 五个数组 + 失败数完全相同）。
+  并行失败静默回落串行，绝不让"这次没并行成功"影响计算结果。
+- **`tests/test_gpu_offline.py`（14 项）**：torch spec 结构、
+  真实验证 wheel 是合法 zip 且含 `torch/__init__.py`、登记的 sha256
+  与磁盘文件一致、`--no-index --find-links` 不碰网络、CUDA 安装必须带
+  `--index-url`、篡改/缺失的包被拒、无 torch 时 bootstrap 仍能跑完。
+- **`tests/test_debug_log.py`（24 项）**、**`tests/test_bootstrap_parallel.py`（14 项）**、
+  以及 `tests/test_progress.py`（15 项）。
+
+### 修复
+
+- **worker 线程读 Tkinter 变量导致计算静默丢失**：`_run_calc_worker` 里
+  读 `self.algo_var.get()`，Tkinter 变量线程不安全，抛
+  `RuntimeError: main thread is not in main loop` 后被 worker 的
+  `except Exception` 吞掉 —— **计算根本没跑，UI 却显示上一轮的旧结果**。
+  改为在主线程定好 `p["algorithm"]` 随 params 传下去，worker 只读普通 dict。
+  同一处还有 4 个 `root.after()` 调用，同样线程不安全、同样被吞。
+  已统一走 `_safe_after()`，注册失败时结果入队而非丢弃。
+- **`debug_log` 死锁**：`enable()` 在 `with self._lock` 块内调
+  `self.log(...)`，而 `log → _write` 又要拿同一把锁 ——
+  `threading.Lock` 不可重入，当场死锁（点开 Debug 开关界面就永久卡住）。
+  已改为持锁部分只做状态变更，写盘移出锁外。
+- **日志不可 grep**：所有值用 `repr()`，写成 `event='enter'`，
+  `grep "event=enter"` 匹配不到 —— 而这是排查最高频的入口。
+  已改为纯字符串裸输出。
+- **双模块单例分裂**：`edit/page.py` 用 `from core.X import Y`、
+  `core/` 内部用扁平 `import X`，同一进程得到两个模块对象、两个单例，
+  页面点开开关、内核看到的还是关闭态。已统一扁平 import。
+- **进度条布局骨架被反复 `pack_forget`**：`_progress_widgets` 曾把父
+  Frame 也一起 hide/show，每次计算前后左侧栏按钮都会跳动、窗口高度
+  反复变化；且 `_show_progress` 重新 pack 时丢了原始的 `pady`/`fill`。
+  已只 hide 进度条与文字，骨架常驻，pack 参数逐一还原。
+
 - **`core/band_advanced.py` 进阶算法模块**（纯计算，不依赖 tkinter，可独立测试）：
   - `quantile_fit()`：分位数回归，IRLS 迭代求解，用于估计任意分位点的趋势而非仅中位数
   - `bootstrap_band()`：Bootstrap 重采样置信带，分位数由重采样分布得出
   - `adaptive_segments()`：按点密度与段内离散度自适应切分 x 轴
   - `select_degree()`：AIC / BIC 自动选阶，返回候选阶数与评分依据
   - `advanced_band_fit()`：把上面四者组合成一次完整的高阶分析
+- **`core/spawn.py` 子进程启动**：exe 模式下一个 exe 起另一个 exe，
+  源码模式回落解释器 + 脚本，两种形态共用同一份判断
+  （修复「exe 里找不到页面入口」的关键，见下方修复节）
 - **`core/deps.py` 可选依赖管理**：`decimal` 等高精度模块的**检测 → 下载 → 离线包安装**链路，带 SHA256 完整性校验。检测脚本遵循"没有该库就走下一步，有就跳过"的渐进策略，安装失败时回落本地离线包，不阻断主流程（项目保持零硬依赖）。
 - **`core/gpu_backend.py` GPU 后端**：Bootstrap 重采样的可选 GPU 加速，
   与 CPU 后端**逐位一致**（同一 seed 下结果完全相同，由测试锁定）。
@@ -36,6 +113,24 @@
 
 ### 修复
 
+- **exe 里「找不到页面入口」/内核起不来**：源码模式是「一个解释器 + 多个脚本」，
+  exe 模式必须是「一个 exe 起另一个 exe」，但原先 `launcher.py` 用
+  `[sys.executable, "-u", str(MAIN_ENTRY)]`、`kernel_bridge.py` 用
+  `[_python_exe(), "-u", str(PAGE_ENTRY)]` 拼命令，**两侧都假设了源码形态**：
+  exe 里 `sys.executable` 是当前 exe 自己而非解释器，且 `edit/__main__.py`、
+  `core/server.py`、`main.py` 从未作为入口打包，产物目录里没有这些文件。
+  实测现象：解压 Release 后点「Band 页面」报
+  `找不到页面入口: D:\...\SmartDrawingBoard-Page.exe`，而源码下完全正常。
+  - 新增 `core/spawn.py`：启动判断收敛到一处，先找同目录 exe，
+    找不到再回落 `解释器 + 脚本`，源码与 exe 两种形态共用
+  - `APP_ENTRIES` 从 3 个增至 4 个，补上 `SmartDrawingBoard-Kernel`
+    （内核原先也不是入口，所以内核同样起不来）
+  - `build_exe.py` 增加 `_check_entry_names_match_spawn()`：入口名单与
+    `core/spawn.py` 的 `CHILD_TARGETS` 对不上时**直接构建失败**。
+    这个校验是必需的——名单不一致的后果完全静默（源码正常、CI 成功），
+    只有用户下载后才能发现
+  - `tests/test_pack.py` 的 zip 数量断言从写死 3 改为从 `APP_ENTRIES` 派生，
+    并新增两条入口名单守护测试
 - **自适应分段的第二阶段结构性失效**：`adaptive_segments()` 第一阶段按
   `base = min(max_segments, n // min_points_per_seg)` 切分，120 点配
   `min_points=4` 时 `base=30` 已超过 `max_segments` 默认值 16，

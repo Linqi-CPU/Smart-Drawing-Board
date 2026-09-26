@@ -81,7 +81,15 @@ class TestBandPageAdvancedUI(unittest.TestCase):
         cls.root.withdraw()          # 不抢焦点，CI 上也能跑
         from edit.page import BandPage
         cls.page = BandPage(cls.root, CLASS_NAME, cls.client, "band")
-        cls.root.update()
+        # 页面本地点集必须一并给：_run_calc() 第一行就是
+        # `if not self.points: return`，只往内核 session 存点的话
+        # 页面侧的点集仍是空的，点"开始计算"会静默返回，
+        # 既不计算也不显示进度条。
+        cls.page.points = list(cls.pts)
+        # 注意：不在这里起 mainloop 线程 —— Tk 要求 mainloop 跑在
+        # 创建 root 的那个线程里，另起线程跑会直接崩。
+        # 需要"完整走一次计算"的测试改走 _run_calc_worker() 同步版，
+        # 见 test_progress_cleared_after_real_advanced_calc。
 
     @classmethod
     def tearDownClass(cls):
@@ -248,6 +256,233 @@ class TestBandPageAdvancedUI(unittest.TestCase):
             self.page._on_calc_done(res, self.page._params(), algo)
             self.pump(60)
             self.assertIn("整体走势", self.adv_text())
+
+    # ------------------------------------------------------------------
+    # 5. 计算进度条
+    # ------------------------------------------------------------------
+    def test_progress_widgets_exist(self):
+        """进度控件必须建好：条 + 文字，都由 _progress_widgets 管。
+
+        只该有**两个**：进度条与文字。骨架 Frame 不进来 ——
+        它被反复 forget/pack 会让周围控件来回跳动。
+        """
+        self.assertTrue(hasattr(self.page, "prog_bar"))
+        self.assertTrue(hasattr(self.page, "prog_label"))
+        self.assertEqual(len(self.page._progress_widgets), 2)
+        self.assertEqual(set(self.page._progress_widgets),
+                         {self.page.prog_bar, self.page.prog_label})
+
+    def test_progress_hidden_initially(self):
+        """没计算时进度区不该占着一行空白。"""
+        self.assertFalse(bool(str(self.page.prog_bar.winfo_manager())))
+        self.assertEqual(self.page.prog_label.cget("text"), "")
+
+    def test_show_then_hide_progress(self):
+        self.page._show_progress()
+        self.root.update()
+        self.assertTrue(bool(str(self.page.prog_bar.winfo_manager())),
+                        "显示后应被 pack 管理")
+        self.assertIn("计算", self.page.prog_label.cget("text"))
+        self.page._hide_progress()
+        self.root.update()
+        self.assertFalse(bool(str(self.page.prog_bar.winfo_manager())),
+                         "隐藏后应脱离 pack 管理")
+
+    def test_progress_bar_actually_has_size(self):
+        """pack 上不等于看得见 —— 尺寸必须非零。
+
+        这条守的是一个真事故：进度条原本在左侧栏，被参数区/导入导出/
+        分段明细挤出了 760px 窗口的可视范围，用户根本看不到它。
+        判据是**有实际尺寸**，不是 pack 状态。
+        """
+        self.page._show_progress()
+        self.root.update_idletasks()
+        w = self.page.prog_bar.winfo_width()
+        h = self.page.prog_bar.winfo_height()
+        self.assertGreater(w, 50,
+                           f"进度条宽度 {w}，可能被布局挤没了")
+        self.assertGreater(h, 5, f"进度条高度 {h}")
+        self.page._hide_progress()
+
+    def test_progress_bar_visible_after_layout(self):
+        """布局走完后进度条应有实际尺寸。
+
+        注意不断言 winfo_ismapped()：测试窗口是 withdraw() 的
+        （不抢焦点，CI 上也能跑），withdraw 的窗口永不 mapped ——
+        那是测试环境的限制，不是产品缺陷。
+        真实可见性由 D:/.cache/e2e/check_progressbar_visible.py
+        在 deiconify() 的真窗口上验证并截图。
+        """
+        self.page._show_progress()
+        self.root.update_idletasks()
+        self.root.update()
+        w = self.page.prog_bar.winfo_width()
+        self.assertGreater(w, 50,
+                           f"布局后宽度仍为 {w}，说明没真正布局")
+        self.page._hide_progress()
+
+    def test_progress_in_right_panel_not_left(self):
+        """进度条必须与结果文本框在**同一栏** —— 左侧装不下。
+
+        左侧有参数区/导入导出/分段明细，总高度超过常见窗口高度，
+        放在那里用户根本看不到（760px 窗口实测如此；
+        整改前后对比见 D:/.cache/e2e/shot_progress_visible.png）。
+
+        布局是：right 容器用 grid 排 [进度区, 结果, 图1, 图2]，
+        进度区与结果区是**兄弟**而非父子。所以判据是共同父容器，
+        不是包含关系。
+        """
+        prog_host = self.page.prog_bar.master          # prog 骨架
+        res_host = self.page.result_text.master        # 结果 LabelFrame
+        # 两者的父容器应是同一个（right）
+        self.assertIs(prog_host.master, res_host.master,
+                      "进度区与结果区不在同一容器，可能被搬回左栏了")
+
+    def test_progress_grid_row_above_result(self):
+        """进度区必须在结果区**上方**（grid 行号更小）。
+
+        用户先看到过程、再看到结果，顺序反了会很怪。
+        """
+        info = self.page.prog_bar.master.grid_info()
+        res_info = self.page.result_text.master.grid_info()
+        self.assertLess(int(info["row"]), int(res_info["row"]),
+                        "进度区应在结果区上方")
+
+    def test_apply_progress_percentage(self):
+        """有总数时显示百分比与 done/total，且 mode 切到 determinate。"""
+        self.page._show_progress()
+        self.page._apply_progress({"active": True, "done": 30,
+                                   "total": 120, "phase": "bootstrap"})
+        self.root.update()
+        self.assertEqual(self.page.prog_bar.cget("value"), 25)
+        self.assertEqual(str(self.page.prog_bar.cget("mode")), "determinate")
+        txt = self.page.prog_label.cget("text")
+        self.assertIn("Bootstrap", txt)
+        self.assertIn("30/120", txt)
+        self.assertIn("25%", txt)
+        self.page._hide_progress()
+
+    def test_apply_progress_unknown_total_goes_indeterminate(self):
+        """total=0（选阶、分段这类阶段）走 indeterminate，不得崩。"""
+        self.page._show_progress()
+        self.page._apply_progress({"active": True, "done": 0, "total": 0,
+                                   "phase": "select_degree"})
+        self.root.update()
+        self.assertEqual(str(self.page.prog_bar.cget("mode")),
+                         "indeterminate")
+        self.assertIn("自动选阶", self.page.prog_label.cget("text"))
+        self.page._hide_progress()
+
+    def test_poll_progress_hides_when_kernel_idle(self):
+        """内核没有进行中的计算时，轮询一次就收起。"""
+        self.page._show_progress()
+        self.page._poll_progress()
+        self.root.update()
+        self.assertFalse(bool(str(self.page.prog_bar.winfo_manager())),
+                         "空闲时应收起")
+        self.assertIsNone(self.page._progress_poll,
+                          "空闲时不该留下待触发的 after 句柄")
+
+    def _run_calc_sync(self):
+        """同步跑完一次计算并把结果送进 UI。
+
+        为什么不走 _run_calc()：它会把 worker 丢进 threading.Thread，
+        而 Tk 的 root.after() 只在 main loop 活着时可跨线程注册 ——
+        测试环境没有 main loop，注册会抛 RuntimeError 并被
+        _safe_after 静默跳过，回调就丢了。
+        这里同线程调 _run_calc_worker()，跑完再手动补执行 pending 回调。
+        """
+        p = self.page._params()
+        p["algorithm"] = self._algo_key_of()
+        self.page._show_progress()
+        self.page._run_calc_worker(p)
+        # 补跑 worker 里没能注册成功的 after 回调
+        for fn in list(self.page._pending_after):
+            fn()
+        self.page._pending_after.clear()
+        self.root.update()
+
+    def _algo_key_of(self):
+        from edit.page import _algo_key
+        return _algo_key(self.page.algo_var.get())
+
+    def test_progress_cleared_after_real_advanced_calc(self):
+        """真跑一次进阶计算，结束后进度必须收起且不留定时器。"""
+        self.select_algo("advanced")
+        self.page.sp_boot.set(4)
+        self._run_calc_sync()
+        self.assertFalse(bool(str(self.page.prog_bar.winfo_manager())),
+                         "计算完成后进度条应收起")
+        self.assertIsNone(self.page._progress_poll,
+                          "计算完成后不该继续轮询")
+        text = self.adv_text()
+        self.assertIn("进阶分析", text)
+        self.assertIn("Bootstrap", text)
+
+    def test_close_stops_progress_poll(self):
+        """关窗口必须取消轮询句柄，否则刷 invalid command name。
+
+        与 main.py 状态定时器踩的是同一个坑（见 CHANGELOG）。
+        """
+        self.page._show_progress()
+        self.page._start_progress_poll()
+        self.assertIsNotNone(self.page._progress_poll)
+        # 只调清理逻辑，不真的销毁窗口（tearDownClass 还要用）
+        self.page._stop_progress_poll()
+        self.root.update()
+        self.assertIsNone(self.page._progress_poll)
+
+    def test_progress_survives_bad_payload(self):
+        """畸形进度数据不能让 UI 崩（内核写什么就显示什么）。"""
+        self.page._show_progress()
+        for bad in ({}, {"active": True},
+                    {"active": True, "done": "x", "total": "y"},
+                    {"active": True, "done": None, "total": None},
+                    {"active": True, "done": 5, "total": 10,
+                     "phase": "unknown_phase"}):
+            try:
+                self.page._apply_progress(bad)
+                self.root.update()
+            except Exception as e:
+                self.page._hide_progress()
+                self.fail(f"畸形进度 {bad!r} 导致异常: {e}")
+        self.page._hide_progress()
+
+    def test_progress_on_all_algorithms(self):
+        """进度条不只服务进阶算法 —— 经典/改进/对比也走同一条路。
+
+        为什么用"是否调用过 show"而不是"点击瞬间是否可见"：
+        经典算法是毫秒级返回的，_run_calc() 返回时 after(0) 里
+        的 _hide_progress 可能已经跑完，进度条现身即消失。
+        那是**正确行为**（快算法不需要进度条停留），
+        断言某个瞬间一定可见是在赌竞态，会随机红。
+        所以这里验证不变量：每次计算都 show 过、且最终都收起。
+        """
+        for key in ("classic", "improved", "compare", "advanced"):
+            self.select_algo(key)
+            self.page.sp_boot.set(2)
+
+            calls = []
+            real_show, real_hide = self.page._show_progress, \
+                self.page._hide_progress
+            self.page._show_progress = lambda: (calls.append("show"),
+                                                real_show())[1]
+            self.page._hide_progress = lambda: (calls.append("hide"),
+                                                real_hide())[1]
+            try:
+                self.page._run_calc()
+                self.pump(2500)
+            finally:
+                self.page._show_progress = real_show
+                self.page._hide_progress = real_hide
+                real_hide()
+
+            self.assertEqual(calls.count("show"), 1,
+                             f"{key} 算法应只 show 一次，实际 {calls}")
+            self.assertIn("hide", calls,
+                          f"{key} 算法结束后应收起")
+            self.assertIsNone(self.page._progress_poll,
+                              f"{key} 算法结束后不该继续轮询")
 
 
 if __name__ == "__main__":

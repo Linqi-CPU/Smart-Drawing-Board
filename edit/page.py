@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import os
 import random
+import sys
+import time
 import tkinter as tk
 import threading
+import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict
@@ -244,12 +247,36 @@ class BandPage:
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
         ttk.Button(left, text="开始计算", command=self._run_calc).pack(
             fill=tk.X, pady=3)
+
+        # 进度条原本放在这里，实测看不见：本栏还有参数区/导入导出/
+        # 分段明细，总高度超过常见窗口高度，进度条被挤到可视区外
+        # （760px 高的窗口里按下拉框后就看不到了）。
+        # 已改到右侧「计算结果」区顶部，见 _build_right。
+
         ttk.Button(left, text="渲染图像", command=self._render).pack(
             fill=tk.X, pady=3)
+        # worker 线程里 root.after() 注册失败时的回调暂存区。
+        # 真机上 main loop 一直活着，永远不会用到；
+        # 但**不能丢**——丢了会让"计算成功界面没反应"与
+        # "根本没算"长得一模一样。
+        self._pending_after = []
+        # Debug 日志开关（页面侧）。内核侧的开关在 debug_log.debug 里，
+        # 两边独立：内核可能跑了多个页面，不该被单个页面的开关影响。
+        self._debug_on = False
+        # 内核进度轮询句柄。None 表示当前没有待触发的轮询。
+        self._progress_poll = None
+
         ttk.Button(left, text="生成报告", command=self._make_report).pack(
             fill=tk.X, pady=3)
         ttk.Button(left, text="重连内核", command=self._reconnect).pack(
             fill=tk.X, pady=3)
+        # ---- Debug 日志 ----
+        # 与"重连内核"并列：两者都是**事后取证**动作，不是业务流程。
+        # 排查"进阶算法为什么慢"时，慢的根因在内核（Bootstrap 并行），
+        # 所以日志必须横跨两侧：页面侧记点击/参数/耗时，内核侧记
+        # 并行状态、单次拟合耗时、失败数。只记一侧等于没记。
+        ttk.Button(left, text="Debug 日志", command=self._toggle_debug_mode
+                   ).pack(fill=tk.X, pady=3)
 
         # ---- 分段明细 ----
         ttk.Label(left, text="分段明细").pack(anchor=tk.W, pady=(10, 2))
@@ -265,12 +292,32 @@ class BandPage:
         right = ttk.Frame(parent)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=3)
-        right.rowconfigure(3, weight=2)
+        right.rowconfigure(2, weight=3)
+        right.rowconfigure(4, weight=2)
+
+        # ---- 计算进度 ----
+        # 位置是实测出来的，不是设计出来的：原本放在左侧「开始计算」
+        # 按钮下方，但本栏还有参数区/导入导出/分段明细，总高度超过
+        # 常见窗口高度 —— 760px 高的窗口里按下拉框后就看不见了。
+        # 右侧永远可见，且它本就是"计算过程"的反馈，与结果放在一起
+        # 比藏在参数栏里更自然：用户看的是结果，过程就该在旁边。
+        prog = ttk.Frame(right)
+        prog.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        self.prog_bar = ttk.Progressbar(prog, mode="determinate",
+                                        maximum=100, value=0)
+        self.prog_bar.pack(fill=tk.X)
+        self.prog_label = ttk.Label(prog, text="", wraplength=420,
+                                    justify=tk.LEFT, foreground="#666666")
+        self.prog_label.pack(fill=tk.X, pady=(2, 0))
+        # 只藏进度条与文字，不藏 prog 骨架：反复 forget/pack 布局骨架
+        # 会让周围控件来回跳动。
+        # 代价是空一小条，远比布局抖动可接受。
+        self._progress_widgets = (self.prog_bar, self.prog_label)
+        self._hide_progress()
 
         # ---- 结果文本 ----
         res = ttk.LabelFrame(right, text="计算结果", padding=8)
-        res.grid(row=0, column=0, sticky="nsew")
+        res.grid(row=2, column=0, sticky="nsew")
         self.result_text = tk.Text(res, height=10, wrap=tk.WORD,
                                    font=("Consolas", 10))
         sb = ttk.Scrollbar(res, orient=tk.VERTICAL,
@@ -281,13 +328,13 @@ class BandPage:
 
         # ---- 走势+包络图 ----
         img1 = ttk.LabelFrame(right, text="整体走势与离散区间", padding=4)
-        img1.grid(row=1, column=0, sticky="nsew", pady=6)
+        img1.grid(row=4, column=0, sticky="nsew", pady=6)
         self.canvas1 = tk.Canvas(img1, bg="#fafafa", highlightthickness=0)
         self.canvas1.pack(fill=tk.BOTH, expand=True)
 
         # ---- 离散宽度图 ----
         img2 = ttk.LabelFrame(right, text="离散宽度 d(x)", padding=4)
-        img2.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
+        img2.grid(row=6, column=0, sticky="nsew", pady=(0, 6))
         self.canvas2 = tk.Canvas(img2, bg="#fafafa", highlightthickness=0)
         self.canvas2.pack(fill=tk.BOTH, expand=True)
 
@@ -316,6 +363,14 @@ class BandPage:
         if self._closed:
             return
         self._closed = True
+
+        # 进度轮询必须先停：它持有 root.after 句柄，窗口销毁后
+        # 仍会被 Tk 派发，刷 invalid command name 噪音
+        #（main.py 的状态定时器踩过同一个坑，见 CHANGELOG）。
+        self._stop_progress_poll()
+        # 关窗后没人要这些结果了。清掉，免得测试补跑时
+        # 对着已销毁的窗口执行回调。
+        self._pending_after.clear()
 
         # 1 + 2：让内核清掉本页面的状态与落盘文件
         try:
@@ -599,25 +654,266 @@ class BandPage:
         self._set_status("计算中…")
         self.root.config(cursor="watch")
         p = self._params()
+        # 算法 key 必须在这里定下来随 params 一起传走。
+        # 早前是 worker 线程里读 self.algo_var.get() —— Tkinter 变量
+        # 不是线程安全的，worker 在 main loop 之外 get() 会抛
+        # "RuntimeError: main thread is not in main loop"，
+        # 于是计算根本没跑，UI 却显示上一轮的旧结果。
+        p["algorithm"] = _algo_key(
+            getattr(self, "algo_var", None) and self.algo_var.get())
+        # 进度条出场 + 开始轮询内核的进度快照。
+        # 只有进阶算法会真报进度（其它算法秒回，轮询一两次就结束），
+        # 但轮询逻辑是通用的，不必为算法分叉。
+        self._show_progress()
+        self._start_progress_poll()
+        self._dlog("calc_clicked", algorithm=p["algorithm"],
+                   n_points=len(self.points), **{
+                       k: p[k] for k in ("n_segments", "degree", "n_boot",
+                                         "alpha", "adaptive", "use_gpu")
+                       if k in p})
         threading.Thread(target=self._run_calc_worker,
                          args=(p,), daemon=True).start()
 
+    # ==================================================================
+    # Debug 日志
+    # ==================================================================
+    # 排查"为什么慢"必须把两侧时间线拼起来：页面侧记点击/参数/总耗时，
+    # 内核侧记并行进程数、每个 chunk 的耗时。只记一侧等于没记 ——
+    # 页面侧只能看到"等了 45 秒"，看不出是串行跑满的还是并行没生效。
+    #
+    # 默认关闭：_log() 在关闭态直接 return，不拼字符串不写盘。
+    def _toggle_debug_mode(self) -> None:
+        """开关执行过程日志。返回切换后的状态。"""
+        try:
+            # 扁平 import，与 core/ 内其他模块的约定一致。
+            # 不能用 `from core.debug_log import debug`：edit/ 侧用
+            # 包形式导入、core/ 侧用扁平导入，同一进程会得到两个
+            # 模块对象、两个单例 —— 开关状态互不可见。
+            import debug_log
+            on = debug_log.debug.toggle()
+            if on:
+                path = debug_log.debug.path or ""
+                # 目录可能还不存在（首次打开），补一次
+                try:
+                    Path(path).parent.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+                self._debug_on = True
+                self._set_status(f"Debug 日志已开启：{path}")
+            else:
+                self._debug_on = False
+                self._set_status("Debug 日志已关闭")
+        except Exception as e:
+            # 日志模块不可用不能挡住主流程
+            messagebox.showerror(APP_NAME, f"无法切换日志开关:\n{e}",
+                                 parent=self.root)
+            self._debug_on = False
+
+    def _dlog(self, tag: str, **fields) -> None:
+        """页面侧记一条。内部已做开关判断，热点路径可直接调。"""
+        if not getattr(self, "_debug_on", False):
+            return
+        try:
+            import debug_log
+            debug_log.debug.log(tag, session=self.session_id, **fields)
+        except Exception:
+            pass
+
+    def _open_debug_log(self) -> None:
+        """用系统默认程序打开日志文件，便于直接看。"""
+        path = None
+        try:
+            import debug_log
+            path = debug_log.debug.path
+        except Exception:
+            path = None
+        if not path or not Path(path).exists():
+            messagebox.showinfo(APP_NAME,
+                                "还没有日志文件。请先点一次「Debug 日志」"
+                                "打开开关，再跑一次计算。",
+                                parent=self.root)
+            return
+        try:
+            os.startfile(str(path))       # noqa: E606  (Windows only)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"打不开日志文件:\n{e}",
+                                 parent=self.root)
+
+    # ==================================================================
+    # 计算进度
+    # ==================================================================
+    # 架构说明：计算跑在**内核进程**里，本页面只是个 HTTP 客户端，
+    # 两边没有长连接。所以进度由内核写进 PageState.progress，
+    # UI 用 /api/pages 轮询来取 —— 复用已有的接口，不新增路由。
+    _PHASE_LABELS = {
+        "select_degree": "自动选阶",
+        "segments": "自适应分段",
+        "quantile": "分位数回归",
+        "bootstrap": "Bootstrap 置信带",
+    }
+    _PROGRESS_POLL_MS = 250
+
+    def _show_progress(self) -> None:
+        # 恢复各自的**原始** pack 参数。重新 pack 时不带参数会让
+        # 间距、fill 全部回默认值，进度区会突然变窄/错位。
+        self.prog_bar.pack(fill=tk.X)
+        self.prog_label.pack(fill=tk.X, pady=(2, 0))
+        self.prog_label.configure(text="计算中…")
+        self.prog_bar.configure(mode="indeterminate", value=0)
+        self.prog_bar.start(12)
+
+    def _hide_progress(self) -> None:
+        try:
+            self.prog_bar.stop()
+        except Exception:
+            pass
+        # 只 forget 这两个；prog 骨架常驻（见 __init__ 里的说明）
+        self.prog_bar.pack_forget()
+        self.prog_label.pack_forget()
+        self.prog_label.configure(text="")
+        self._stop_progress_poll()
+
+    def _start_progress_poll(self) -> None:
+        self._stop_progress_poll()
+        self._progress_poll = self.root.after(
+            self._PROGRESS_POLL_MS, self._poll_progress)
+
+    def _stop_progress_poll(self) -> None:
+        if getattr(self, "_progress_poll", None) is not None:
+            try:
+                self.root.after_cancel(self._progress_poll)
+            except Exception:
+                pass
+            self._progress_poll = None
+
+    def _poll_progress(self) -> None:
+        """查一次内核的进度快照并刷新控件；计算结束就收起。
+
+        复用既有的 /api/sessions（客户端方法 sessions()）而不是新增
+        一个"取进度"接口：PageState.progress 已经在 to_dict() 里，
+        再为它开一条路由纯粹是重复造轮子。
+        """
+        self._progress_poll = None
+        try:
+            items = self.client.sessions() or []
+            mine = None
+            for it in items:
+                if str(it.get("session_id")) == str(self.session_id):
+                    mine = it
+                    break
+            prog = (mine or {}).get("progress") or {}
+            if prog.get("active"):
+                self._apply_progress(prog)
+                # 还没结束，继续轮
+                self._progress_poll = self.root.after(
+                    self._PROGRESS_POLL_MS, self._poll_progress)
+                return
+        except Exception:
+            # 轮询失败不打扰用户：进度是观察性的，
+            # 内核正忙时接口也可能暂时无响应。
+            pass
+        # 到这里说明计算已结束（或查不到）——收起进度条。
+        # 真正的结果显示由 _on_calc_done 负责，这里只管进度 UI。
+        self._hide_progress()
+
+    def _apply_progress(self, prog: dict) -> None:
+        # 容错转换：进度数据来自另一个进程，本就把"坏了"当作要处理
+        # 的情况之一。int() 失败时退回 0，进度最多显示得不准，
+        # 但不能让一次轮询的异常把整个回调链打断。
+        try:
+            done = int(prog.get("done") or 0)
+        except (TypeError, ValueError):
+            done = 0
+        try:
+            total = int(prog.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        phase = str(prog.get("phase") or "")
+        name = self._PHASE_LABELS.get(phase, phase)
+        prefix = f"{name}：" if name else "计算中"
+
+        if total > 0:
+            pct = min(100, max(0, round(done * 100.0 / total)))
+            # 切到 determinate 才能显示百分比。
+            # mode 是可以反复 configure 的，没必要为两种模式建两个控件。
+            try:
+                self.prog_bar.configure(mode="determinate")
+                self.prog_bar.stop()
+            except Exception:
+                pass
+            self.prog_bar.configure(value=pct)
+            self.prog_label.configure(text=f"{prefix}{pct}%（{done}/{total}）")
+        else:
+            # 总数未知（选阶、分段这类轻量阶段）→ 走 indeterminate，
+            # 至少让用户知道"在动"
+            try:
+                if str(self.prog_bar.cget("mode")) != "indeterminate":
+                    self.prog_bar.configure(mode="indeterminate")
+                    self.prog_bar.start(12)
+            except Exception:
+                pass
+            self.prog_label.configure(text=prefix)
+
+    # ==================================================================
+    # 线程安全回跳
+    # ==================================================================
+    # root.after() 与 Tkinter 变量一样不是线程安全的：在 worker 线程里
+    # 调用会抛 "RuntimeError: main thread is not in main loop"。
+    # 一旦抛了，异常被 worker 的 except 吞掉，计算结果就静默丢失 ——
+    # 用户点完按钮界面毫无变化，是最难排查的一类"假死"。
+    def _safe_after(self, ms: int, fn) -> None:
+        """确保 fn 在主线程运行。
+
+        root.after() 与 Tkinter 变量一样不是线程安全的：在 worker
+        线程里调用会抛 "RuntimeError: main thread is not in main loop"
+        （或窗口已销毁时的 TclError）。真机上 main loop 一直活着，
+        不会走到这里；测试环境没有 main loop，注册必然失败 ——
+        那种情况下不能再把结果静默丢掉，否则"计算成功界面没反应"
+        与"根本没算"长得一模一样。改为入队 _pending_after，
+        由测试手动补跑。
+        """
+        def _run():
+            try:
+                fn()
+            except tk.TclError:
+                # 窗口已销毁：不是错误，只是没人要这个结果了
+                pass
+            except Exception:
+                # 这里不能再向 root.after 跳了（可能仍在关窗流程中），
+                # 否则递归；打印出来便于从死亡日志发现
+                traceback.print_exc()
+
+        try:
+            self.root.after(ms, _run)
+        except (RuntimeError, tk.TclError) as e:
+            if getattr(self, "_closed", False):
+                return          # 正在关窗，没人要结果了
+            self._pending_after.append(_run)
+            # 用 stderr 而非 print，避免污染 stdout 抓取
+            print(f"[band] after() 注册失败，结果入队: {type(e).__name__}",
+                  file=sys.stderr)
+
     def _run_calc_worker(self, p: dict) -> None:
-        algo = _algo_key(getattr(self, "algo_var", None) and self.algo_var.get())
+        # 算法从 params 取，不在这个线程里读 Tkinter 变量 ——
+        # 它们是线程不安全的，这里 get() 会抛 RuntimeError。
+        algo = _algo_key(p.get("algorithm"))
+        t0 = time.perf_counter()
         try:
             if algo == "improved":
                 res = self.client.band_fit_improved(self.session_id,
                                                     n_segments=p["n_segments"],
                                                     degree=p["degree"])
-                self.root.after(0, lambda: self._on_calc_done(res, p, "improved"))
+                self._safe_after(0, lambda: self._on_calc_done(
+                    res, p, "improved"))
             elif algo == "compare":
                 classic = self.client.band_fit(self.session_id,
                                                n_segments=p["n_segments"],
                                                degree=p["degree"])
-                improved = self.client.band_fit_improved(self.session_id,
-                                                         n_segments=p["n_segments"],
-                                                         degree=p["degree"])
-                self.root.after(0, lambda: self._on_compare_done(classic, improved, p))
+                improved = self.client.band_fit_improved(
+                    self.session_id, n_segments=p["n_segments"],
+                    degree=p["degree"])
+                self._safe_after(0, lambda: self._on_compare_done(
+                    classic, improved, p))
             elif algo == "advanced":
                 res = self.client.band_fit_advanced(
                     self.session_id,
@@ -631,20 +927,40 @@ class BandPage:
                     use_gpu=p["use_gpu"],
                     seed=p["seed"],
                 )
-                self.root.after(0, lambda: self._on_calc_done(res, p, "advanced"))
+                self._safe_after(0, lambda: self._on_calc_done(
+                    res, p, "advanced"))
+                self._dlog("calc_done", algorithm="advanced",
+                           elapsed_ms=round(
+                               (time.perf_counter() - t0) * 1000, 1),
+                           n_boot=p.get("n_boot"),
+                           r2=res.get("r2"),
+                           boot_backend=(res.get("advanced") or {}).get(
+                               "boot_backend"))
             else:
                 res = self.client.band_fit(self.session_id,
                                            n_segments=p["n_segments"],
                                            degree=p["degree"])
-                self.root.after(0, lambda: self._on_calc_done(res, p, "classic"))
+                self._safe_after(0, lambda: self._on_calc_done(
+                    res, p, "classic"))
+                self._dlog("calc_done", algorithm=algo,
+                           elapsed_ms=round(
+                               (time.perf_counter() - t0) * 1000, 1),
+                           r2=res.get("r2"))
         except KernelClientError as e:
-            self.root.after(0, lambda: self._on_calc_error(e))
+            self._dlog("calc_error", algorithm=algo,
+                       elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+                       err=str(e)[:200])
+            self._safe_after(0, lambda: self._on_calc_error(e))
         except Exception as e:
-            self.root.after(0, lambda: self._on_calc_error(
+            self._dlog("calc_error", algorithm=algo,
+                       elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+                       err=f"{type(e).__name__}: {e}"[:200])
+            self._safe_after(0, lambda: self._on_calc_error(
                 KernelClientError(f"{type(e).__name__}: {e}")))
 
     def _on_compare_done(self, classic: dict, improved: dict, p: dict) -> None:
         self.root.config(cursor="")
+        self._hide_progress()
         self.result = classic
         self.result_improved = improved
         self._render_compare_text(classic, improved)
@@ -673,12 +989,14 @@ class BandPage:
 
     def _on_calc_error(self, err) -> None:
         self.root.config(cursor="")
+        self._hide_progress()
         self._set_status(f"计算失败: {err}")
         messagebox.showerror(APP_NAME, f"计算失败:\n{err}",
                              parent=self.root)
 
     def _on_calc_done(self, res: dict, p: dict, algo: str = "classic") -> None:
         self.root.config(cursor="")
+        self._hide_progress()
         self.result = res
         self._render_text(res, algo)
         self._fill_tree(res)

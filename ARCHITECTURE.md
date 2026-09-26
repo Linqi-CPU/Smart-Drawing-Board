@@ -33,6 +33,7 @@
 │   ├── band_fit.py     分段包络估计算法
 │   ├── band_advanced.py 进阶算法：quantile_fit 分位数回归 / bootstrap_band 置信带 /
 │   │                     adaptive_segments 自适应分段 / select_degree AIC-BIC 选阶
+│   ├── spawn.py         子进程启动：源码用解释器+脚本，exe 用同目录 exe
 │   ├── fitting.py      多项式 / 多变量最小二乘（Legendre 正交基）
 │   ├── gpu_backend.py  可选 GPU 后端（Bootstrap 加速，与 CPU 逐位一致）
 │   ├── deps.py         可选依赖管理（检测 → 下载 → 离线包 + SHA256 校验）
@@ -88,7 +89,18 @@ edit/page.py ──────────────────────�
 
 ---
 
-## 3. 三个进程角色
+## 3. 进程角色与启动方式
+
+> **分发形态下进程是「一个 exe 起另一个 exe」。**
+> 源码模式用 `[sys.executable, "-u", 脚本]` 没问题，但 exe 里
+> `sys.executable` 是当前 exe 自己、不是解释器，且页面/内核/主 UI 的
+> 脚本都没被打进产物目录。所以 `core/spawn.py` 统一了启动判断：
+> **先找同目录的对应 exe，找不到再回落解释器 + 脚本**。
+> `launcher.py` 与 `kernel_bridge.py` 都走它，不再各自拼命令。
+>
+> 四个入口必须全部打包，少一个则该功能在 exe 里报「找不到入口」，
+> 而源码模式与 CI 构建都显示正常。`build_exe.py` 的
+> `_check_entry_names_match_spawn()` 会在构建时校验名单一致性。
 
 ### 3.1 内核（core.server）
 
